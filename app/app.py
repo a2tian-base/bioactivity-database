@@ -8,7 +8,7 @@ from psycopg.errors import UniqueViolation
 import streamlit as st
 
 
-st.set_page_config(page_title="hERG IC50 MVP", layout="wide")
+st.set_page_config(page_title="hERG IC50 Database", layout="wide")
 
 ALLOWED_IDENTIFIER_TYPES = {"a_number", "unii", "pubchem_cid", "chembl_id"}
 ALLOWED_IC50_UNITS = {"pM", "nM", "uM", "mM"}
@@ -501,8 +501,7 @@ def render_import_summary(entity: str, summary: Dict) -> None:
 
 st.title("hERG IC50 Database")
 st.write(
-    "Minimal UI to register compounds, store IC50 measurements, and review results. "
-    "Compounds are deduplicated by identifier and assigned a canonical `compound_id` automatically."
+    "Use this interface to manually upload results and browse the data."
 )
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
