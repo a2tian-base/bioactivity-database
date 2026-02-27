@@ -505,7 +505,7 @@ st.write(
 )
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Add Compound", "Add IC50 Result", "Browse Results", "Upload CSV", "Dashboard"]
+    ["Add Compound", "Add IC50 Result", "Upload CSV", "Browse Results", "Dashboard"]
 )
 
 with tab1:
@@ -594,7 +594,7 @@ with tab2:
             except Exception as exc:
                 st.error(f"Failed to save IC50 result: {exc}")
 
-with tab3:
+with tab4:
     st.subheader("Recent Results")
     limit = st.slider("Rows to show", min_value=10, max_value=1000, value=100, step=10)
     try:
@@ -612,7 +612,7 @@ with tab3:
     except Exception as exc:
         st.error(f"Failed to load results: {exc}")
 
-with tab4:
+with tab3:
     st.subheader("Upload CSV")
     st.write("Bulk upload compounds and IC50 results directly from CSV files.")
 

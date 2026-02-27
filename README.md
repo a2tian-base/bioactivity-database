@@ -53,6 +53,42 @@ Helper function:
   - updates missing identifiers/aliases on an existing match
   - returns canonical `compound_id`
 
+### Schema Diagram
+
+```mermaid
+erDiagram
+    compounds ||--o{ ic50_results : "has many"
+
+    compounds {
+        BIGSERIAL compound_id PK
+        TEXT a_number UK
+        TEXT unii UK
+        BIGINT pubchem_cid UK
+        TEXT chembl_id UK
+        TEXT smiles
+        TEXT[] common_names
+        TIMESTAMPTZ created_at
+        TIMESTAMPTZ updated_at
+    }
+
+    ic50_results {
+        BIGSERIAL result_id PK
+        BIGINT compound_id FK
+        NUMERIC ic50_value
+        TEXT ic50_unit
+        CHAR qualifier
+        NUMERIC ic50_nm
+        NUMERIC pic50
+        TEXT source_ref
+        TIMESTAMPTZ created_at
+    }
+```
+
+Notes:
+- `compound_id` is assigned automatically.
+- `register_compound(...)` deduplicates compounds across identifiers and returns the canonical `compound_id`.
+- `ic50_nm` and `pic50` are computed in the database trigger.
+
 ## 3. Local Run (Create + Start)
 
 ### Prerequisites
