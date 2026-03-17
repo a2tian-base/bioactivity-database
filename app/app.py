@@ -1,280 +1,81 @@
-import os
 import math
+import uuid
 from typing import Dict, List, Optional
 
 import pandas as pd
-import psycopg
-from psycopg.errors import UniqueViolation
 import streamlit as st
+from psycopg.errors import UniqueViolation
+
+from herg.db import (
+    fetch_compounds,
+    fetch_dashboard_data,
+    fetch_dashboard_metrics,
+    fetch_results,
+    get_conn,
+    resolve_compound_id,
+    upsert_compound,
+    upsert_ic50_result,
+    upsert_source_record,
+)
+from herg.models import CompoundInput, Ic50Input, SourceRecordInput
+from herg.normalization import (
+    build_identifier_inputs,
+    build_name_inputs,
+    clean_text,
+    normalize_ic50_unit,
+    normalize_qualifier,
+    parse_optional_positive_int,
+    parse_pipe_or_comma_names,
+)
 
 
 st.set_page_config(page_title="hERG IC50 Database", layout="wide")
 
-ALLOWED_IDENTIFIER_TYPES = {"a_number", "unii", "pubchem_cid", "chembl_id"}
-ALLOWED_IC50_UNITS = {"pM", "nM", "uM", "mM"}
-ALLOWED_QUALIFIERS = {"=", "<", ">"}
-
-
-def get_conn() -> psycopg.Connection:
-    return psycopg.connect(
-        host=os.getenv("DB_HOST", "localhost"),
-        port=os.getenv("DB_PORT", "5432"),
-        dbname=os.getenv("DB_NAME", "herg"),
-        user=os.getenv("DB_USER", "herg_user"),
-        password=os.getenv("DB_PASSWORD", "change_me"),
-    )
-
-
-def clean_text(value: object) -> str:
-    if value is None:
-        return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except TypeError:
-        pass
-    text = str(value).strip()
-    if text.lower() in {"nan", "none", "null"}:
-        return ""
-    return text
-
-
-def parse_optional_positive_int(value: object) -> Optional[int]:
-    text = clean_text(value)
-    if not text:
-        return None
-    try:
-        number = float(text)
-    except ValueError as exc:
-        raise ValueError(f"Expected positive integer, got '{text}'.") from exc
-    if number <= 0 or not number.is_integer():
-        raise ValueError(f"Expected positive integer, got '{text}'.")
-    return int(number)
-
-
-def parse_common_names(common_names_input: str) -> List[str]:
-    names = [name.strip() for name in common_names_input.split(",")]
-    return [name for name in names if name]
-
-
-def parse_common_names_field(value: object) -> List[str]:
-    text = clean_text(value)
-    if not text:
-        return []
-    delimiter = "|" if "|" in text else ","
-    names = [name.strip() for name in text.split(delimiter)]
-    return [name for name in names if name]
-
-
-def normalize_ic50_unit(unit_value: object) -> str:
-    raw = clean_text(unit_value).replace("µ", "u").replace("μ", "u")
-    mapping = {
-        "pm": "pM",
-        "nm": "nM",
-        "um": "uM",
-        "mm": "mM",
-    }
-    unit = mapping.get(raw.lower(), raw)
-    if unit not in ALLOWED_IC50_UNITS:
-        raise ValueError(f"Invalid ic50_unit '{raw}'. Allowed: pM, nM, uM, mM.")
-    return unit
-
-
-def normalize_qualifier(qualifier_value: object) -> str:
-    qualifier = clean_text(qualifier_value)
-    if qualifier not in ALLOWED_QUALIFIERS:
-        raise ValueError("Invalid qualifier. Allowed values are '=', '<', '>'.")
-    return qualifier
-
 
 def build_compound_label(compound: Dict) -> str:
-    id_parts = []
-    if compound["a_number"]:
-        id_parts.append(f"A-number:{compound['a_number']}")
-    if compound["unii"]:
-        id_parts.append(f"UNII:{compound['unii']}")
-    if compound["pubchem_cid"]:
-        id_parts.append(f"PubChem:{compound['pubchem_cid']}")
-    if compound["chembl_id"]:
-        id_parts.append(f"ChEMBL:{compound['chembl_id']}")
+    compound_id = compound.get("compound_id")
+    preferred_name = clean_text(compound.get("preferred_name"))
+    chembl_id = clean_text(compound.get("chembl_id"))
+    a_number = clean_text(compound.get("a_number"))
+    unii = clean_text(compound.get("unii"))
+    pubchem_cid = compound.get("pubchem_cid")
+    standard_inchikey = clean_text(compound.get("standard_inchikey"))
 
-    alias_text = ", ".join(compound["common_names"]) if compound["common_names"] else ""
-    id_text = " | ".join(id_parts) if id_parts else f"compound_id:{compound['compound_id']}"
-    if alias_text:
-        id_text = f"{id_text} | aliases:{alias_text}"
-    return f"{id_text} (id={compound['compound_id']})"
-
-
-def fetch_compounds() -> List[Dict]:
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                compound_id,
-                a_number,
-                unii,
-                pubchem_cid,
-                chembl_id,
-                smiles,
-                common_names,
-                created_at
-            FROM compounds
-            ORDER BY
-                COALESCE(a_number, chembl_id, unii, pubchem_cid::TEXT, compound_id::TEXT) ASC
-            """
-        )
-        rows = cur.fetchall()
-    return [
-        {
-            "compound_id": row[0],
-            "a_number": row[1],
-            "unii": row[2],
-            "pubchem_cid": row[3],
-            "chembl_id": row[4],
-            "smiles": row[5],
-            "common_names": row[6] or [],
-            "created_at": row[7],
-        }
-        for row in rows
-    ]
-
-
-def register_compound_with_cursor(
-    cur: psycopg.Cursor,
-    a_number: str,
-    unii: str,
-    pubchem_cid: Optional[int],
-    chembl_id: str,
-    smiles: str,
-    common_names: List[str],
-) -> int:
-    cur.execute(
-        """
-        SELECT register_compound(%s, %s, %s, %s, %s, %s::text[])
-        """,
-        (
-            a_number.strip(),
-            unii.strip(),
-            pubchem_cid,
-            chembl_id.strip(),
-            smiles.strip(),
-            common_names,
-        ),
-    )
-    row = cur.fetchone()
-    return row[0]
-
-
-def register_compound(
-    a_number: str,
-    unii: str,
-    pubchem_cid: Optional[int],
-    chembl_id: str,
-    smiles: str,
-    common_names: List[str],
-) -> int:
-    with get_conn() as conn, conn.cursor() as cur:
-        return register_compound_with_cursor(
-            cur=cur,
-            a_number=a_number,
-            unii=unii,
-            pubchem_cid=pubchem_cid,
-            chembl_id=chembl_id,
-            smiles=smiles,
-            common_names=common_names,
-        )
-
-
-def insert_ic50_result_with_cursor(
-    cur: psycopg.Cursor,
-    compound_id: int,
-    ic50_value: float,
-    ic50_unit: str,
-    qualifier: str,
-    source_ref: str,
-) -> Dict:
-    cur.execute(
-        """
-        INSERT INTO ic50_results (compound_id, ic50_value, ic50_unit, qualifier, source_ref)
-        VALUES (%s, %s, %s, %s, NULLIF(%s, ''))
-        RETURNING result_id, ic50_nm, pic50
-        """,
-        (compound_id, ic50_value, ic50_unit, qualifier, source_ref),
-    )
-    row = cur.fetchone()
-    return {"result_id": row[0], "ic50_nm": row[1], "pic50": row[2]}
-
-
-def insert_ic50_result(
-    compound_id: int, ic50_value: float, ic50_unit: str, qualifier: str, source_ref: str
-) -> Dict:
-    with get_conn() as conn, conn.cursor() as cur:
-        return insert_ic50_result_with_cursor(
-            cur=cur,
-            compound_id=compound_id,
-            ic50_value=ic50_value,
-            ic50_unit=ic50_unit,
-            qualifier=qualifier,
-            source_ref=source_ref,
-        )
-
-
-def resolve_compound_id_by_identifier(cur: psycopg.Cursor, id_type: str, id_value: str) -> Optional[int]:
-    if id_type == "a_number":
-        cur.execute(
-            """
-            SELECT compound_id
-            FROM compounds
-            WHERE LOWER(BTRIM(a_number)) = LOWER(BTRIM(%s))
-            """,
-            (id_value,),
-        )
-    elif id_type == "unii":
-        cur.execute(
-            """
-            SELECT compound_id
-            FROM compounds
-            WHERE LOWER(BTRIM(unii)) = LOWER(BTRIM(%s))
-            """,
-            (id_value,),
-        )
-    elif id_type == "chembl_id":
-        cur.execute(
-            """
-            SELECT compound_id
-            FROM compounds
-            WHERE LOWER(BTRIM(chembl_id)) = LOWER(BTRIM(%s))
-            """,
-            (id_value,),
-        )
-    elif id_type == "pubchem_cid":
-        pubchem_cid = parse_optional_positive_int(id_value)
-        if pubchem_cid is None:
-            return None
-        cur.execute(
-            """
-            SELECT compound_id
-            FROM compounds
-            WHERE pubchem_cid = %s
-            """,
-            (pubchem_cid,),
-        )
+    if preferred_name:
+        label = preferred_name
+    elif chembl_id:
+        label = f"ChEMBL:{chembl_id}"
+    elif a_number:
+        label = f"A-number:{a_number}"
+    elif unii:
+        label = f"UNII:{unii}"
+    elif pubchem_cid:
+        label = f"PubChem:{pubchem_cid}"
     else:
-        return None
+        label = f"compound_id:{compound_id}"
 
-    row = cur.fetchone()
-    return None if row is None else row[0]
+    if standard_inchikey:
+        label = f"{label} | InChIKey:{standard_inchikey}"
+
+    return f"{label} (id={compound_id})"
 
 
 def import_compounds_csv(df: pd.DataFrame) -> Dict:
     normalized = df.copy()
     normalized.columns = [str(col).strip().lower() for col in normalized.columns]
 
-    expected_columns = {"a_number", "unii", "pubchem_cid", "chembl_id", "smiles", "common_names"}
-    id_columns = {"a_number", "unii", "pubchem_cid", "chembl_id"}
+    expected_columns = {
+        "a_number",
+        "unii",
+        "pubchem_cid",
+        "chembl_id",
+        "standard_inchikey",
+        "standard_inchi",
+        "canonical_smiles",
+        "preferred_name",
+        "common_names",
+    }
 
-    if not id_columns.intersection(set(normalized.columns)):
-        raise ValueError("CSV must include at least one identifier column: a_number, unii, pubchem_cid, chembl_id.")
     unknown = [col for col in normalized.columns if col not in expected_columns]
     if unknown:
         raise ValueError(f"Unexpected columns: {', '.join(unknown)}")
@@ -292,22 +93,38 @@ def import_compounds_csv(df: pd.DataFrame) -> Dict:
                 a_number = clean_text(record.get("a_number"))
                 unii = clean_text(record.get("unii"))
                 chembl_id = clean_text(record.get("chembl_id"))
-                smiles = clean_text(record.get("smiles"))
-                pubchem_cid = parse_optional_positive_int(record.get("pubchem_cid"))
-                common_names = parse_common_names_field(record.get("common_names"))
+                standard_inchikey = clean_text(record.get("standard_inchikey"))
+                standard_inchi = clean_text(record.get("standard_inchi"))
+                canonical_smiles = clean_text(record.get("canonical_smiles"))
+                preferred_name = clean_text(record.get("preferred_name"))
+                aliases = parse_pipe_or_comma_names(record.get("common_names"))
 
-                if not any([a_number, unii, pubchem_cid is not None, chembl_id]):
-                    raise ValueError("No identifier provided.")
+                pubchem_cid_value: Optional[int] = None
+                pubchem_text = clean_text(record.get("pubchem_cid"))
+                if pubchem_text:
+                    pubchem_cid_value = parse_optional_positive_int(pubchem_text)
 
-                register_compound_with_cursor(
-                    cur=cur,
-                    a_number=a_number,
-                    unii=unii,
-                    pubchem_cid=pubchem_cid,
-                    chembl_id=chembl_id,
-                    smiles=smiles,
-                    common_names=common_names,
+                identifier_values = {
+                    "a_number": a_number,
+                    "unii": unii,
+                    "pubchem_cid": str(pubchem_cid_value) if pubchem_cid_value is not None else "",
+                    "chembl_id": chembl_id,
+                }
+                identifiers = build_identifier_inputs(identifier_values)
+                names = build_name_inputs(preferred_name=preferred_name, aliases=aliases)
+
+                if not identifiers and not standard_inchikey:
+                    raise ValueError("No identifier or Standard InChIKey provided.")
+
+                compound_input = CompoundInput(
+                    canonical_smiles=canonical_smiles,
+                    standard_inchi=standard_inchi,
+                    standard_inchikey=standard_inchikey,
+                    identifiers=identifiers,
+                    names=names,
                 )
+
+                upsert_compound(cur, compound_input)
                 cur.execute("RELEASE SAVEPOINT csv_row")
                 imported += 1
             except Exception as exc:
@@ -322,13 +139,22 @@ def import_ic50_csv(df: pd.DataFrame) -> Dict:
     normalized = df.copy()
     normalized.columns = [str(col).strip().lower() for col in normalized.columns]
 
-    required_columns = {"id_type", "id_value", "ic50_value", "ic50_unit", "qualifier"}
+    required_columns = {
+        "id_type",
+        "id_value",
+        "ic50_value",
+        "ic50_unit",
+        "qualifier",
+        "source_name",
+        "source_record_key",
+        "source_release",
+        "source_url",
+    }
     missing = [col for col in required_columns if col not in normalized.columns]
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
 
-    allowed_columns = required_columns | {"source_ref"}
-    unknown = [col for col in normalized.columns if col not in allowed_columns]
+    unknown = [col for col in normalized.columns if col not in required_columns]
     if unknown:
         raise ValueError(f"Unexpected columns: {', '.join(unknown)}")
     if normalized.empty:
@@ -344,12 +170,12 @@ def import_ic50_csv(df: pd.DataFrame) -> Dict:
             try:
                 id_type = clean_text(record.get("id_type")).lower()
                 id_value = clean_text(record.get("id_value"))
-                if id_type not in ALLOWED_IDENTIFIER_TYPES:
-                    raise ValueError("id_type must be one of: a_number, unii, pubchem_cid, chembl_id.")
+                if not id_type:
+                    raise ValueError("id_type is required.")
                 if not id_value:
                     raise ValueError("id_value is required.")
 
-                compound_id = resolve_compound_id_by_identifier(cur=cur, id_type=id_type, id_value=id_value)
+                compound_id = resolve_compound_id(cur=cur, id_type=id_type, id_value=id_value)
                 if compound_id is None:
                     raise ValueError(f"No compound found for {id_type}='{id_value}'.")
 
@@ -363,15 +189,39 @@ def import_ic50_csv(df: pd.DataFrame) -> Dict:
 
                 ic50_unit = normalize_ic50_unit(record.get("ic50_unit"))
                 qualifier = normalize_qualifier(record.get("qualifier"))
-                source_ref = clean_text(record.get("source_ref"))
 
-                insert_ic50_result_with_cursor(
-                    cur=cur,
-                    compound_id=compound_id,
+                source_name = clean_text(record.get("source_name"))
+                source_record_key = clean_text(record.get("source_record_key"))
+                source_release = clean_text(record.get("source_release"))
+                source_url = clean_text(record.get("source_url"))
+
+                if not source_name:
+                    raise ValueError("source_name is required.")
+                if not source_record_key:
+                    raise ValueError("source_record_key is required.")
+
+                source_input = SourceRecordInput(
+                    source_name=source_name,
+                    source_record_key=source_record_key,
+                    record_type="csv_import",
+                    source_release=source_release,
+                    source_url=source_url,
+                )
+
+                source_record_id = upsert_source_record(cur, source_input)
+
+                measurement = Ic50Input(
                     ic50_value=ic50_value,
                     ic50_unit=ic50_unit,
                     qualifier=qualifier,
-                    source_ref=source_ref,
+                    endpoint="IC50",
+                )
+
+                upsert_ic50_result(
+                    cur=cur,
+                    compound_id=compound_id,
+                    source_record_id=source_record_id,
+                    measurement=measurement,
                 )
                 cur.execute("RELEASE SAVEPOINT csv_row")
                 imported += 1
@@ -381,91 +231,6 @@ def import_ic50_csv(df: pd.DataFrame) -> Dict:
                 errors.append({"row": row_index, "error": str(exc)})
 
     return {"total": len(records), "imported": imported, "failed": len(errors), "errors": errors}
-
-
-def fetch_results(limit: int) -> pd.DataFrame:
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                r.result_id,
-                r.compound_id,
-                c.a_number,
-                c.unii,
-                c.pubchem_cid,
-                c.chembl_id,
-                c.common_names,
-                r.ic50_value,
-                r.ic50_unit,
-                r.qualifier,
-                r.ic50_nm,
-                r.pic50,
-                r.source_ref,
-                r.created_at
-            FROM ic50_results r
-            JOIN compounds c ON c.compound_id = r.compound_id
-            ORDER BY r.created_at DESC
-            LIMIT %s
-            """,
-            (limit,),
-        )
-        rows = cur.fetchall()
-        columns = [desc.name for desc in cur.description]
-    return pd.DataFrame(rows, columns=columns)
-
-
-def fetch_dashboard_metrics() -> Dict:
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                (SELECT COUNT(*) FROM compounds) AS compounds_n,
-                (SELECT COUNT(*) FROM ic50_results) AS results_n,
-                (SELECT COUNT(DISTINCT compound_id) FROM ic50_results) AS compounds_with_results_n,
-                (SELECT MIN(created_at) FROM ic50_results) AS first_result_at,
-                (SELECT MAX(created_at) FROM ic50_results) AS last_result_at
-            """
-        )
-        row = cur.fetchone()
-    return {
-        "compounds_n": row[0] or 0,
-        "results_n": row[1] or 0,
-        "compounds_with_results_n": row[2] or 0,
-        "first_result_at": row[3],
-        "last_result_at": row[4],
-    }
-
-
-def fetch_dashboard_data(limit: int) -> pd.DataFrame:
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                r.result_id,
-                r.compound_id,
-                r.ic50_value,
-                r.ic50_unit,
-                r.qualifier,
-                r.ic50_nm,
-                r.pic50,
-                r.created_at,
-                COALESCE(
-                    NULLIF(BTRIM(c.chembl_id), ''),
-                    NULLIF(BTRIM(c.a_number), ''),
-                    NULLIF(BTRIM(c.unii), ''),
-                    CASE WHEN c.pubchem_cid IS NULL THEN NULL ELSE 'PUBCHEM:' || c.pubchem_cid::TEXT END,
-                    'compound_id:' || c.compound_id::TEXT
-                ) AS compound_label
-            FROM ic50_results r
-            JOIN compounds c ON c.compound_id = r.compound_id
-            ORDER BY r.created_at DESC
-            LIMIT %s
-            """,
-            (limit,),
-        )
-        rows = cur.fetchall()
-        columns = [desc.name for desc in cur.description]
-    return pd.DataFrame(rows, columns=columns)
 
 
 def build_histogram_counts(series: pd.Series, bins: int) -> pd.DataFrame:
@@ -500,9 +265,7 @@ def render_import_summary(entity: str, summary: Dict) -> None:
 
 
 st.title("hERG IC50 Database")
-st.write(
-    "Use this interface to manually upload results and browse the data."
-)
+st.write("Use this interface to manually upload results and browse the data.")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["Add Compound", "Add IC50 Result", "Upload CSV", "Browse Results", "Dashboard"]
@@ -515,20 +278,26 @@ with tab1:
         unii = st.text_input("UNII (optional)", max_chars=100)
         pubchem_cid_text = st.text_input("PubChem CID (optional)", max_chars=30)
         chembl_id = st.text_input("ChEMBL ID (optional)", max_chars=100)
-        smiles = st.text_area("SMILES (optional)", height=100)
-        common_names_text = st.text_input("Common names / aliases (comma-separated, optional)")
+        standard_inchikey = st.text_input("Standard InChIKey (optional)", max_chars=200)
+        standard_inchi = st.text_area("Standard InChI (optional)", height=80)
+        canonical_smiles = st.text_area("Canonical SMILES (optional)", height=80)
+        preferred_name = st.text_input("Preferred name (optional)", max_chars=200)
+        aliases_text = st.text_input("Aliases (pipe or comma-separated, optional)")
         submitted = st.form_submit_button("Save Compound")
 
     if submitted:
-        a_number_value = a_number.strip()
-        unii_value = unii.strip()
-        chembl_value = chembl_id.strip()
-        smiles_value = smiles.strip()
-        common_names_value = parse_common_names(common_names_text)
+        a_number_value = clean_text(a_number)
+        unii_value = clean_text(unii)
+        chembl_value = clean_text(chembl_id)
+        standard_inchikey_value = clean_text(standard_inchikey)
+        standard_inchi_value = clean_text(standard_inchi)
+        canonical_smiles_value = clean_text(canonical_smiles)
+        preferred_name_value = clean_text(preferred_name)
+        aliases_value = parse_pipe_or_comma_names(aliases_text)
 
         pubchem_cid_value: Optional[int] = None
         input_error = False
-        pubchem_text = pubchem_cid_text.strip()
+        pubchem_text = clean_text(pubchem_cid_text)
         if pubchem_text:
             try:
                 pubchem_cid_value = parse_optional_positive_int(pubchem_text)
@@ -536,27 +305,29 @@ with tab1:
                 st.error("`pubchem_cid` must be a positive integer.")
                 input_error = True
 
-        has_identifier = any(
-            [
-                a_number_value,
-                unii_value,
-                pubchem_cid_value is not None,
-                chembl_value,
-            ]
-        )
+        identifier_values = {
+            "a_number": a_number_value,
+            "unii": unii_value,
+            "pubchem_cid": str(pubchem_cid_value) if pubchem_cid_value is not None else "",
+            "chembl_id": chembl_value,
+        }
+        identifiers = build_identifier_inputs(identifier_values)
+        names = build_name_inputs(preferred_name=preferred_name_value, aliases=aliases_value)
 
-        if not input_error and not has_identifier:
-            st.error("Provide at least one identifier: A-number, UNII, PubChem CID, or ChEMBL ID.")
+        if not input_error and not identifiers and not standard_inchikey_value:
+            st.error("Provide at least one identifier or a Standard InChIKey.")
         elif not input_error:
+            compound_input = CompoundInput(
+                canonical_smiles=canonical_smiles_value,
+                standard_inchi=standard_inchi_value,
+                standard_inchikey=standard_inchikey_value,
+                identifiers=identifiers,
+                names=names,
+            )
+
             try:
-                compound_id = register_compound(
-                    a_number=a_number_value,
-                    unii=unii_value,
-                    pubchem_cid=pubchem_cid_value,
-                    chembl_id=chembl_value,
-                    smiles=smiles_value,
-                    common_names=common_names_value,
-                )
+                with get_conn() as conn, conn.cursor() as cur:
+                    compound_id = upsert_compound(cur, compound_input)
                 st.success(f"Compound saved/matched as compound_id={compound_id}.")
             except UniqueViolation:
                 st.error("Identifier conflict found while saving compound.")
@@ -575,21 +346,50 @@ with tab2:
             ic50_value = st.number_input("IC50 Value", min_value=0.000001, value=100.0, step=1.0, format="%.6f")
             ic50_unit = st.selectbox("IC50 Unit", options=["pM", "nM", "uM", "mM"], index=1)
             qualifier = st.selectbox("Qualifier", options=["=", "<", ">"], index=0)
-            source_ref = st.text_input("Source Reference (optional)")
+            source_name = st.text_input("Source name", value="manual")
+            source_record_key = st.text_input("Source record key (optional)")
+            source_release = st.text_input("Source release (optional)")
+            source_url = st.text_input("Source URL (optional)")
             submitted_result = st.form_submit_button("Save IC50 Result")
 
         if submitted_result:
             try:
-                result = insert_ic50_result(
-                    compound_id=compound_options[compound_label],
-                    ic50_value=float(ic50_value),
-                    ic50_unit=ic50_unit,
-                    qualifier=qualifier,
-                    source_ref=source_ref.strip(),
+                source_name_value = clean_text(source_name)
+                if not source_name_value:
+                    raise ValueError("source_name is required.")
+
+                source_record_key_value = clean_text(source_record_key)
+                if not source_record_key_value:
+                    source_record_key_value = f"manual:{uuid.uuid4()}"
+
+                source_input = SourceRecordInput(
+                    source_name=source_name_value,
+                    source_record_key=source_record_key_value,
+                    record_type="manual_entry",
+                    source_release=clean_text(source_release),
+                    source_url=clean_text(source_url),
                 )
+
+                measurement = Ic50Input(
+                    ic50_value=float(ic50_value),
+                    ic50_unit=normalize_ic50_unit(ic50_unit),
+                    qualifier=normalize_qualifier(qualifier),
+                    endpoint="IC50",
+                )
+
+                with get_conn() as conn, conn.cursor() as cur:
+                    source_record_id = upsert_source_record(cur, source_input)
+                    result = upsert_ic50_result(
+                        cur,
+                        compound_options[compound_label],
+                        source_record_id,
+                        measurement,
+                    )
+
                 st.success(
                     f"Result #{result['result_id']} saved. "
-                    f"ic50_nm={result['ic50_nm']}, pIC50={result['pic50']}."
+                    f"ic50_nm={result['ic50_nm']}, pIC50={result['pic50']} "
+                    f"(qualifier {result['pic50_qualifier']})."
                 )
             except Exception as exc:
                 st.error(f"Failed to save IC50 result: {exc}")
@@ -617,14 +417,13 @@ with tab3:
     st.write("Bulk upload compounds and IC50 results directly from CSV files.")
 
     compounds_template = (
-        "a_number,unii,pubchem_cid,chembl_id,smiles,common_names\n"
-        "A-0001,,702,CHEMBL545,CCO,ethanol|ethyl alcohol\n"
-        ",RZVAJINKPMORJF-UHFFFAOYSA-N,1983,CHEMBL112,,acetaminophen|paracetamol\n"
+        "a_number,unii,pubchem_cid,chembl_id,standard_inchikey,standard_inchi,canonical_smiles,preferred_name,common_names\n"
+        "A-0001,,702,CHEMBL545,LFQSCWFLJHTTHZ-UHFFFAOYSA-N,,CCO,ethanol,ethyl alcohol|alcohol\n"
     )
     ic50_template = (
-        "id_type,id_value,ic50_value,ic50_unit,qualifier,source_ref\n"
-        "chembl_id,CHEMBL545,125,nM,=,internal_run_001\n"
-        "chembl_id,CHEMBL112,0.85,uM,<,internal_run_001\n"
+        "id_type,id_value,ic50_value,ic50_unit,qualifier,source_name,source_record_key,source_release,source_url\n"
+        "chembl_id,CHEMBL545,125,nM,=,manual,manual:001,,\n"
+        "pubchem_cid,1983,0.85,uM,<,literature,paper:smith-2024-table2,,\n"
     )
 
     st.download_button(
@@ -641,7 +440,10 @@ with tab3:
     )
 
     st.markdown("### Import compounds CSV")
-    st.caption("Expected columns: a_number, unii, pubchem_cid, chembl_id, smiles, common_names")
+    st.caption(
+        "Expected columns: a_number, unii, pubchem_cid, chembl_id, standard_inchikey, "
+        "standard_inchi, canonical_smiles, preferred_name, common_names"
+    )
     uploaded_compounds = st.file_uploader("Choose compounds CSV", type=["csv"], key="upload_compounds_csv")
     if st.button("Import compounds CSV", key="import_compounds_btn"):
         if uploaded_compounds is None:
@@ -656,7 +458,10 @@ with tab3:
                 st.error(f"Compounds CSV import failed: {exc}")
 
     st.markdown("### Import IC50 CSV")
-    st.caption("Expected columns: id_type, id_value, ic50_value, ic50_unit, qualifier, source_ref")
+    st.caption(
+        "Expected columns: id_type, id_value, ic50_value, ic50_unit, qualifier, "
+        "source_name, source_record_key, source_release, source_url"
+    )
     uploaded_ic50 = st.file_uploader("Choose IC50 CSV", type=["csv"], key="upload_ic50_csv")
     if st.button("Import IC50 CSV", key="import_ic50_btn"):
         if uploaded_ic50 is None:
