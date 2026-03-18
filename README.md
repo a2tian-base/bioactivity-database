@@ -3,7 +3,7 @@
 Minimal SQL-first system for storing hERG IC50 data with:
 - PostgreSQL database
 - Normalized compound identifiers + names + provenance
-- Database-derived `ic50_nm`, `pIC50`, and `pIC50` qualifier
+- Database-derived `ic50_um`, `pIC50`, and `pIC50` qualifier
 - Minimal Streamlit frontend for data entry and browsing
 
 ## 1. What This Repository Contains
@@ -51,7 +51,7 @@ Five core tables:
   - structured provenance for every ingested row
 - `ic50_results`
   - IC50 value, unit, qualifier, endpoint
-  - `ic50_nm`, `pic50`, `pic50_qualifier` are generated in the database
+  - `ic50_um`, `pic50`, `pic50_qualifier` are generated in the database
 
 Read models:
 - `compound_summary_v`
@@ -65,7 +65,7 @@ Helper functions:
 
 Notes:
 - InChIKey is first-class (`compounds.standard_inchikey`).
-- Ingesters preserve the original source units and qualifiers; the database derives `ic50_nm` and `pIC50`.
+- Ingesters preserve the original source units and qualifiers; the database derives `ic50_um` and `pIC50`.
 
 ### Schema Diagram
 
@@ -125,7 +125,7 @@ erDiagram
         NUMERIC ic50_value
         TEXT ic50_unit
         CHAR qualifier
-        NUMERIC ic50_nm
+        NUMERIC ic50_um
         NUMERIC pic50
         CHAR pic50_qualifier
         TIMESTAMPTZ created_at
@@ -184,7 +184,7 @@ docker compose up -d --build
 5. Use `Dashboard` tab to visualize entry counts and distributions
 6. Browse/download recent results as CSV
 
-`ic50_nm`, `pIC50`, and `pIC50` qualifier are computed in the database.
+`ic50_um`, `pIC50`, and `pIC50` qualifier are computed in the database.
 
 ## 5. Populate the Database
 
@@ -212,7 +212,7 @@ Notes:
 Dashboard includes:
 - summary metrics (`compounds`, `entries`, `compounds with results`, first/latest entry dates)
 - qualifier and unit distributions
-- pIC50 and log10(IC50 nM) histograms
+- pIC50 and log10(IC50 uM) histograms
 - entries-over-time trend and top compounds by entry count
 
 ### Option B: Populate with SQL in `psql` (scriptable)
@@ -388,7 +388,7 @@ SELECT
   ic50_value,
   ic50_unit,
   qualifier,
-  ic50_nm,
+  ic50_um,
   pic50,
   pic50_qualifier,
   source_name,

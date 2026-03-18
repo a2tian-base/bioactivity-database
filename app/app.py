@@ -6,19 +6,17 @@ import pandas as pd
 import streamlit as st
 from psycopg.errors import UniqueViolation
 
-from herg.db import (
+from herg.db import get_conn, upsert_compound, upsert_ic50_result, upsert_source_record
+from herg.read_db import (
     fetch_compounds,
     fetch_dashboard_data,
     fetch_dashboard_metrics,
     fetch_results,
-    get_conn,
+    fetch_results_count,
     resolve_compound_id,
-    upsert_compound,
-    upsert_ic50_result,
-    upsert_source_record,
 )
 from herg.models import CompoundInput, Ic50Input, SourceRecordInput
-from herg.normalization import (
+from herg.normalize import (
     build_identifier_inputs,
     build_name_inputs,
     clean_text,
@@ -388,27 +386,47 @@ with tab2:
 
                 st.success(
                     f"Result #{result['result_id']} saved. "
-                    f"ic50_nm={result['ic50_nm']}, pIC50={result['pic50']} "
+                    f"ic50_um={result['ic50_um']}, pIC50={result['pic50']} "
                     f"(qualifier {result['pic50_qualifier']})."
                 )
             except Exception as exc:
                 st.error(f"Failed to save IC50 result: {exc}")
 
 with tab4:
-    st.subheader("Recent Results")
-    limit = st.slider("Rows to show", min_value=10, max_value=1000, value=100, step=10)
+    st.subheader("Browse Results")
+    limit = st.slider("Rows to preview", min_value=10, max_value=1000, value=100, step=10)
     try:
+        total_results = fetch_results_count()
         results_df = fetch_results(limit)
-        if results_df.empty:
+        if total_results == 0 or results_df.empty:
             st.info("No IC50 results found yet.")
         else:
+            st.caption(
+                f"Previewing {len(results_df):,} of {total_results:,} rows. "
+                "The on-screen table stays capped for performance."
+            )
             st.dataframe(results_df, use_container_width=True, hide_index=True)
             st.download_button(
-                label="Download CSV",
+                label="Download preview CSV",
                 data=results_df.to_csv(index=False).encode("utf-8"),
-                file_name="ic50_results.csv",
+                file_name="ic50_results_preview.csv",
                 mime="text/csv",
             )
+
+            prepare_full_export = st.checkbox(
+                "Prepare full CSV export",
+                help="Load every row from the database and make it available as a CSV download.",
+            )
+            if prepare_full_export:
+                with st.spinner("Preparing full results export..."):
+                    full_results_df = fetch_results(limit=None)
+                st.caption(f"Full export contains {len(full_results_df):,} rows.")
+                st.download_button(
+                    label="Download full results CSV",
+                    data=full_results_df.to_csv(index=False).encode("utf-8"),
+                    file_name="ic50_results_all.csv",
+                    mime="text/csv",
+                )
     except Exception as exc:
         st.error(f"Failed to load results: {exc}")
 
@@ -518,9 +536,9 @@ with tab5:
         st.info("No IC50 data available yet.")
     else:
         dashboard_df["created_at"] = pd.to_datetime(dashboard_df["created_at"], errors="coerce")
-        dashboard_df["ic50_nm"] = pd.to_numeric(dashboard_df["ic50_nm"], errors="coerce")
+        dashboard_df["ic50_um"] = pd.to_numeric(dashboard_df["ic50_um"], errors="coerce")
         dashboard_df["pic50"] = pd.to_numeric(dashboard_df["pic50"], errors="coerce")
-        dashboard_df["log10_ic50_nm"] = dashboard_df["ic50_nm"].apply(
+        dashboard_df["log10_ic50_um"] = dashboard_df["ic50_um"].apply(
             lambda value: math.log10(value) if pd.notna(value) and value > 0 else None
         )
 
@@ -587,8 +605,8 @@ with tab5:
                 else:
                     st.bar_chart(pic50_hist.set_index("bin"))
             with value_col2:
-                st.caption("log10(IC50 nM) histogram")
-                ic50_log_hist = build_histogram_counts(filtered_df["log10_ic50_nm"], bins=30)
+                st.caption("log10(IC50 uM) histogram")
+                ic50_log_hist = build_histogram_counts(filtered_df["log10_ic50_um"], bins=30)
                 if ic50_log_hist.empty:
                     st.info("No valid IC50 values.")
                 else:

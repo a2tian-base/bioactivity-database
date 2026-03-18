@@ -24,16 +24,16 @@ AS $$
     END;
 $$;
 
-CREATE OR REPLACE FUNCTION convert_to_nm(p_value NUMERIC, p_unit TEXT)
+CREATE OR REPLACE FUNCTION convert_to_um(p_value NUMERIC, p_unit TEXT)
 RETURNS NUMERIC
 LANGUAGE SQL
 IMMUTABLE
 AS $$
     SELECT CASE p_unit
-        WHEN 'pM' THEN p_value * 0.001
-        WHEN 'nM' THEN p_value
-        WHEN 'uM' THEN p_value * 1000
-        WHEN 'mM' THEN p_value * 1000000
+        WHEN 'pM' THEN p_value * 0.000001
+        WHEN 'nM' THEN p_value * 0.001
+        WHEN 'uM' THEN p_value
+        WHEN 'mM' THEN p_value * 1000
         ELSE NULL
     END;
 $$;
@@ -138,6 +138,35 @@ CREATE TABLE source_records (
 CREATE INDEX idx_source_records_source_name
     ON source_records(source_name);
 
+CREATE TABLE compound_identifier_sources (
+    compound_identifier_source_id BIGSERIAL PRIMARY KEY,
+    compound_identifier_id BIGINT NOT NULL
+        REFERENCES compound_identifiers(compound_identifier_id) ON DELETE CASCADE,
+    source_record_id BIGINT NOT NULL
+        REFERENCES source_records(source_record_id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (compound_identifier_id, source_record_id)
+);
+
+CREATE INDEX idx_compound_identifier_sources_compound_identifier_id
+    ON compound_identifier_sources(compound_identifier_id);
+
+CREATE INDEX idx_compound_identifier_sources_source_record_id
+    ON compound_identifier_sources(source_record_id);
+
+CREATE TABLE compound_structure_assertions (
+    compound_structure_assertion_id BIGSERIAL PRIMARY KEY,
+    compound_id BIGINT NOT NULL
+        REFERENCES compounds(compound_id) ON DELETE CASCADE,
+    source_record_id BIGINT NOT NULL
+        REFERENCES source_records(source_record_id) ON DELETE CASCADE,
+    canonical_smiles TEXT,
+    standard_inchi TEXT,
+    standard_inchikey TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (compound_id, source_record_id)
+);
+
 CREATE TABLE ic50_results (
     result_id BIGSERIAL PRIMARY KEY,
     compound_id BIGINT NOT NULL REFERENCES compounds(compound_id) ON DELETE RESTRICT,
@@ -146,11 +175,11 @@ CREATE TABLE ic50_results (
     ic50_value NUMERIC(14, 6) NOT NULL CHECK (ic50_value > 0),
     ic50_unit TEXT NOT NULL CHECK (ic50_unit IN ('pM', 'nM', 'uM', 'mM')),
     qualifier CHAR(1) NOT NULL CHECK (qualifier IN ('=', '<', '>')),
-    ic50_nm NUMERIC(18, 6) GENERATED ALWAYS AS (
-        convert_to_nm(ic50_value, ic50_unit)
+    ic50_um NUMERIC(18, 6) GENERATED ALWAYS AS (
+        convert_to_um(ic50_value, ic50_unit)
     ) STORED,
     pic50 NUMERIC(10, 4) GENERATED ALWAYS AS (
-        ROUND((9 - LOG(10, convert_to_nm(ic50_value, ic50_unit)))::NUMERIC, 4)
+        ROUND((6 - LOG(10, convert_to_um(ic50_value, ic50_unit)))::NUMERIC, 4)
     ) STORED,
     pic50_qualifier CHAR(1) GENERATED ALWAYS AS (
         invert_qualifier(qualifier)
@@ -234,22 +263,16 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION register_compound_v2(
-    p_identifiers JSONB DEFAULT '[]'::JSONB,
-    p_names JSONB DEFAULT '[]'::JSONB,
-    p_canonical_smiles TEXT DEFAULT NULL,
-    p_standard_inchi TEXT DEFAULT NULL,
-    p_standard_inchikey TEXT DEFAULT NULL
+CREATE OR REPLACE FUNCTION resolve_compound_by_keys(
+    p_standard_inchikey TEXT DEFAULT NULL,
+    p_identifiers JSONB DEFAULT '[]'::JSONB
 ) RETURNS BIGINT
 LANGUAGE plpgsql
+STABLE
 AS $$
 DECLARE
     v_identifiers JSONB := COALESCE(p_identifiers, '[]'::JSONB);
-    v_names JSONB := COALESCE(p_names, '[]'::JSONB);
-    v_canonical_smiles TEXT := NULLIF(BTRIM(p_canonical_smiles), '');
-    v_standard_inchi TEXT := NULLIF(BTRIM(p_standard_inchi), '');
     v_standard_inchikey TEXT := NULLIF(BTRIM(p_standard_inchikey), '');
-    v_compound_id BIGINT;
     v_match_count INTEGER;
     v_inchikey_match_id BIGINT;
     v_identifier_match_id BIGINT;
@@ -270,7 +293,6 @@ BEGIN
         SELECT
             LOWER(BTRIM(namespace)) AS namespace,
             NULLIF(BTRIM(value), '') AS identifier_value,
-            COALESCE(is_primary, false) AS is_primary,
             normalize_identifier(LOWER(BTRIM(namespace)), NULLIF(BTRIM(value), '')) AS normalized_value
         FROM jsonb_to_recordset(v_identifiers) AS x(namespace TEXT, value TEXT, is_primary BOOLEAN)
     ),
@@ -296,16 +318,37 @@ BEGIN
         ELSIF v_identifier_match_count = 1 AND v_identifier_match_id <> v_inchikey_match_id THEN
             RAISE EXCEPTION 'Provided identifiers conflict with standard_inchikey match.';
         END IF;
-        v_compound_id := v_inchikey_match_id;
-    ELSE
-        IF v_identifier_match_count > 1 THEN
-            RAISE EXCEPTION 'Provided identifiers match multiple compounds.';
-        ELSIF v_identifier_match_count = 1 THEN
-            v_compound_id := v_identifier_match_id;
-        ELSE
-            v_compound_id := NULL;
-        END IF;
+        RETURN v_inchikey_match_id;
     END IF;
+
+    IF v_identifier_match_count > 1 THEN
+        RAISE EXCEPTION 'Provided identifiers match multiple compounds.';
+    ELSIF v_identifier_match_count = 1 THEN
+        RETURN v_identifier_match_id;
+    END IF;
+
+    RETURN NULL;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION register_compound_v2(
+    p_identifiers JSONB DEFAULT '[]'::JSONB,
+    p_names JSONB DEFAULT '[]'::JSONB,
+    p_canonical_smiles TEXT DEFAULT NULL,
+    p_standard_inchi TEXT DEFAULT NULL,
+    p_standard_inchikey TEXT DEFAULT NULL
+) RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_identifiers JSONB := COALESCE(p_identifiers, '[]'::JSONB);
+    v_names JSONB := COALESCE(p_names, '[]'::JSONB);
+    v_canonical_smiles TEXT := NULLIF(BTRIM(p_canonical_smiles), '');
+    v_standard_inchi TEXT := NULLIF(BTRIM(p_standard_inchi), '');
+    v_standard_inchikey TEXT := NULLIF(BTRIM(p_standard_inchikey), '');
+    v_compound_id BIGINT;
+BEGIN
+    v_compound_id := resolve_compound_by_keys(v_standard_inchikey, v_identifiers);
 
     IF v_compound_id IS NULL THEN
         INSERT INTO compounds (
@@ -499,7 +542,7 @@ CREATE OR REPLACE FUNCTION upsert_ic50_result(
     p_qualifier CHAR(1)
 ) RETURNS TABLE (
     result_id BIGINT,
-    ic50_nm NUMERIC,
+    ic50_um NUMERIC,
     pic50 NUMERIC,
     pic50_qualifier CHAR(1)
 )
@@ -529,7 +572,7 @@ BEGIN
         ic50_value = EXCLUDED.ic50_value,
         ic50_unit = EXCLUDED.ic50_unit,
         qualifier = EXCLUDED.qualifier
-    RETURNING ic50_results.result_id, ic50_results.ic50_nm, ic50_results.pic50, ic50_results.pic50_qualifier;
+    RETURNING ic50_results.result_id, ic50_results.ic50_um, ic50_results.pic50, ic50_results.pic50_qualifier;
 END;
 $$;
 
@@ -585,7 +628,7 @@ SELECT
     r.ic50_value,
     r.ic50_unit,
     r.qualifier,
-    r.ic50_nm,
+    r.ic50_um,
     r.pic50,
     r.pic50_qualifier,
     r.created_at,

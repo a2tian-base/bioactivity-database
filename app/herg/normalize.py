@@ -29,17 +29,46 @@ def clean_text(value: object) -> str:
     return text
 
 
+def parse_positive_float(value: object) -> float:
+    text = clean_text(value)
+    if not text:
+        raise ValueError("Expected positive number, got empty value.")
+    try:
+        parsed = float(text)
+    except ValueError as exc:
+        raise ValueError(f"Expected positive number, got '{text}'.") from exc
+    if parsed <= 0:
+        raise ValueError(f"Expected positive number, got '{text}'.")
+    return parsed
+
+
+def parse_positive_int(value: object) -> int:
+    text = clean_text(value)
+    if not text:
+        raise ValueError("Expected positive integer, got empty value.")
+    try:
+        parsed = float(text)
+    except ValueError as exc:
+        raise ValueError(f"Expected positive integer, got '{text}'.") from exc
+    if parsed <= 0 or not parsed.is_integer():
+        raise ValueError(f"Expected positive integer, got '{text}'.")
+    return int(parsed)
+
+
 def parse_optional_positive_int(value: object) -> int | None:
     text = clean_text(value)
     if not text:
         return None
-    try:
-        number = float(text)
-    except ValueError as exc:
-        raise ValueError(f"Expected positive integer, got '{text}'.") from exc
-    if number <= 0 or not number.is_integer():
-        raise ValueError(f"Expected positive integer, got '{text}'.")
-    return int(number)
+    return parse_positive_int(text)
+
+
+def parse_bool(value: object) -> bool:
+    text = clean_text(value).lower()
+    if text in {"1", "true", "t", "yes", "y"}:
+        return True
+    if text in {"", "0", "false", "f", "no", "n"}:
+        return False
+    raise ValueError(f"Expected boolean value, got '{clean_text(value)}'.")
 
 
 def normalize_ic50_unit(unit_value: object) -> str:

@@ -1,0 +1,14 @@
+{
+  "PropertyTable": {
+    "Properties": [
+      {
+        "CID": 3,
+        "Title": "PubChemTest",
+        "CanonicalSMILES": "CCO",
+        "ConnectivitySMILES": "CCO",
+        "InChI": "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3",
+        "InChIKey": "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
+      }
+    ]
+  }
+}
