@@ -234,7 +234,7 @@ def import_ic50_csv(df: pd.DataFrame) -> Dict:
 def build_histogram_counts(series: pd.Series, bins: int) -> pd.DataFrame:
     numeric = pd.to_numeric(series, errors="coerce").dropna()
     if numeric.empty:
-        return pd.DataFrame(columns=["bin", "count"])
+        return pd.DataFrame(columns=["bin_start", "bin_end", "bin", "count"])
 
     min_value = float(numeric.min())
     max_value = float(numeric.max())
@@ -246,6 +246,8 @@ def build_histogram_counts(series: pd.Series, bins: int) -> pd.DataFrame:
     counts = bucketed.value_counts(sort=False)
     return pd.DataFrame(
         {
+            "bin_start": [float(interval.left) for interval in counts.index],
+            "bin_end": [float(interval.right) for interval in counts.index],
             "bin": [f"{interval.left:.2f} to {interval.right:.2f}" for interval in counts.index],
             "count": counts.values,
         }
@@ -603,14 +605,14 @@ with tab5:
                 if pic50_hist.empty:
                     st.info("No valid pIC50 values.")
                 else:
-                    st.bar_chart(pic50_hist.set_index("bin"))
+                    st.bar_chart(pic50_hist.set_index("bin_start")[["count"]])
             with value_col2:
                 st.caption("log10(IC50 uM) histogram")
                 ic50_log_hist = build_histogram_counts(filtered_df["log10_ic50_um"], bins=30)
                 if ic50_log_hist.empty:
                     st.info("No valid IC50 values.")
                 else:
-                    st.bar_chart(ic50_log_hist.set_index("bin"))
+                    st.bar_chart(ic50_log_hist.set_index("bin_start")[["count"]])
 
             st.markdown("### Trend and Top Compounds")
             trend_col1, trend_col2 = st.columns(2)
