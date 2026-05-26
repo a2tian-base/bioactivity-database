@@ -1,5 +1,4 @@
 {$APP_DOMAIN:localhost} {
-    tls {$ACME_EMAIL}
-    encode gzip zstd
-    reverse_proxy frontend:8501
+	encode gzip zstd
+	reverse_proxy frontend:8501
 }
