@@ -177,6 +177,34 @@ def test_pipeline_dual_writes_generic_results_and_preserves_ic50_idempotence():
         )
         generic = cur.fetchone()
 
+        cur.execute(
+            """
+            SELECT
+                i.ic50_value,
+                i.ic50_unit,
+                i.qualifier,
+                i.ic50_um,
+                i.pic50,
+                i.pic50_qualifier,
+                br.original_value,
+                br.original_unit,
+                br.original_relation,
+                br.standard_value,
+                br.standard_unit,
+                br.standard_relation,
+                br.p_value,
+                br.p_value_relation
+            FROM ic50_results i
+            JOIN bioactivity_results br
+              ON br.source_record_id = i.source_record_id
+            WHERE i.source_record_id IN (
+                SELECT source_record_id FROM source_records WHERE source_name = %s
+            )
+            """,
+            (adapter.source_name,),
+        )
+        duplicate_values = cur.fetchone()
+
         assert source_count == 1
         assert results_count == 1
         assert ic50_um is not None
@@ -198,6 +226,22 @@ def test_pipeline_dual_writes_generic_results_and_preserves_ic50_idempotence():
         assert generic[11] == "uM"
         assert generic[12] == pic50
         assert generic[13] == "="
+        assert duplicate_values == (
+            Decimal("100.000000"),
+            "nM",
+            "=",
+            Decimal("0.100000"),
+            pic50,
+            "=",
+            Decimal("100.0"),
+            "nM",
+            "=",
+            Decimal("0.100000"),
+            "uM",
+            "=",
+            pic50,
+            "=",
+        )
 
         _cleanup(cur, adapter.source_name, adapter.source_name)
         conn.commit()

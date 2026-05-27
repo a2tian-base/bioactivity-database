@@ -175,6 +175,10 @@ def run_pipeline(
             try:
                 compound_id = upsert_compound(cur, staged.compound)
                 source_record_id = upsert_source_record(cur, staged.source_record)
+                # Migration 012 compatibility strategy: retain legacy ic50_results
+                # dual-write while bioactivity_results is the primary endpoint
+                # result store. Do not change this without an explicit data
+                # migration plan for existing IC50 consumers.
                 ic50_result = upsert_ic50_result(cur, compound_id, source_record_id, staged.measurement)
                 if endpoint_id is not None:
                     upsert_bioactivity_result(
