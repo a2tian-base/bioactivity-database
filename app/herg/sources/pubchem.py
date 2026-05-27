@@ -268,8 +268,18 @@ class PubChemAdapter:
             measurement=measurement,
         )
 
+    def measurement_input_from_record(
+        self,
+        record: StagedRecord,
+        ic50_result: Mapping[str, Any] | None = None,
+    ) -> MeasurementInput:
+        return measurement_input_from_pubchem_record(record, ic50_result)
 
-def measurement_input_from_pubchem_record(record: StagedRecord) -> MeasurementInput:
+
+def measurement_input_from_pubchem_record(
+    record: StagedRecord,
+    ic50_result: Mapping[str, Any] | None = None,
+) -> MeasurementInput:
     concise_row = record.source_record.raw_payload.get("concise_row") or {}
     assay_context = {
         "aid": clean_text(concise_row.get("AID")),
@@ -280,11 +290,15 @@ def measurement_input_from_pubchem_record(record: StagedRecord) -> MeasurementIn
         "assay_name": clean_text(concise_row.get("Assay Name")),
     }
     assay_context = {key: value for key, value in assay_context.items() if value}
+    ic50_result = ic50_result or {}
     return measurement_from_ic50(
         result_key=record.external_key,
         ic50_value=record.measurement.ic50_value,
         ic50_unit=record.measurement.ic50_unit,
         qualifier=record.measurement.qualifier,
+        ic50_um=ic50_result.get("ic50_um"),
+        pic50=ic50_result.get("pic50"),
+        pic50_qualifier=ic50_result.get("pic50_qualifier"),
         assay_context=assay_context,
         quality_flags={"source": PubChemAdapter.source_name},
     )

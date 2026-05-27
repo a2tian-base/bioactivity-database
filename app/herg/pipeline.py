@@ -126,6 +126,17 @@ def _measurement_input_from_staged_record(
     )
 
 
+def _measurement_input_for_adapter(
+    adapter: SourceAdapter,
+    staged: StagedRecord,
+    ic50_result: dict[str, Any],
+) -> MeasurementInput:
+    mapper = getattr(adapter, "measurement_input_from_record", None)
+    if callable(mapper):
+        return mapper(staged, ic50_result)
+    return _measurement_input_from_staged_record(staged, ic50_result, adapter.source_name)
+
+
 def run_pipeline(
     adapter: SourceAdapter,
     db_config: DbConfig,
@@ -183,11 +194,7 @@ def run_pipeline(
                         compound_id=compound_id,
                         source_record_id=source_record_id,
                         ingestion_run_id=ingestion_run_id,
-                        measurement=_measurement_input_from_staged_record(
-                            staged,
-                            ic50_result,
-                            adapter.source_name,
-                        ),
+                        measurement=_measurement_input_for_adapter(adapter, staged, ic50_result),
                     )
                 cur.execute("RELEASE SAVEPOINT ingest_row")
                 stats.stored += 1
