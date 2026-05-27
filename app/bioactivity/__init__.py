@@ -11,6 +11,7 @@ from .endpoints import (
     load_endpoint,
 )
 from .models import MeasurementInput, measurement_from_ic50
+from .runs import finish_ingestion_run, start_ingestion_run
 
 __all__ = [
     "EndpointConfig",
@@ -20,7 +21,9 @@ __all__ = [
     "MeasurementInput",
     "MissingSourceConfigError",
     "get_source_config",
+    "finish_ingestion_run",
     "load_endpoint",
     "measurement_from_ic50",
+    "start_ingestion_run",
     "upsert_bioactivity_result",
 ]
