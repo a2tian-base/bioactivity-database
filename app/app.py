@@ -10,12 +10,15 @@ from psycopg.errors import UniqueViolation
 from bioactivity.db import upsert_bioactivity_result
 from bioactivity.endpoints import EndpointConfig, list_active_endpoints, load_endpoint
 from bioactivity.models import MeasurementInput, measurement_from_ic50
+from bioactivity.preview import PreviewExample, PreviewResult, preview_endpoint_source
 from bioactivity.results import (
     count_bioactivity_results,
     fetch_bioactivity_results,
     format_bioactivity_result_row,
     manual_entry_schema,
 )
+from bioactivity.ui_ingestion import UiIngestionRequest, UiIngestionResult, run_ui_ingestion
+from herg.config import HttpConfig
 from herg.db import get_conn, upsert_compound, upsert_ic50_result, upsert_source_record
 from herg.models import CompoundInput, Ic50Input, SourceRecordInput
 from herg.normalize import (
@@ -324,6 +327,108 @@ def _format_results_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(formatted_rows)
 
 
+def _preview_examples_dataframe(examples: list[PreviewExample]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for example in examples:
+        rows.append(
+            {
+                "external_key": example.external_key,
+                "source_record_key": example.source_record_key,
+                "measurement": example.measurement,
+                "raw_summary": example.raw_summary,
+                "reason": example.reason,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def preview_result_display_data(result: PreviewResult) -> dict[str, Any]:
+    return {
+        "summary": {
+            "raw_rows_examined": result.raw_rows_examined,
+            "accepted": result.accepted_count,
+            "skipped": result.skipped_count,
+            "errors": result.error_count,
+        },
+        "query_config": result.query_config,
+        "accepted": _preview_examples_dataframe(result.accepted_examples),
+        "skipped": _preview_examples_dataframe(result.skipped_examples),
+        "errors": _preview_examples_dataframe(result.error_examples),
+        "warnings": result.warnings,
+    }
+
+
+def ingestion_result_summary(result: UiIngestionResult) -> dict[str, Any]:
+    return {
+        "endpoint_key": result.endpoint_key,
+        "source_name": result.source_name,
+        "dry_run": result.dry_run,
+        "processed": result.processed,
+        "stored": result.stored,
+        "updated": result.updated,
+        "skipped_invalid": result.skipped_invalid,
+        "failed": result.failed,
+        "warnings": result.warnings,
+        "duration_seconds": result.duration_seconds,
+        "ingestion_run_id": result.ingestion_run_id,
+    }
+
+
+def render_preview_result(result: PreviewResult) -> None:
+    display = preview_result_display_data(result)
+    summary = display["summary"]
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Examined", f"{summary['raw_rows_examined']:,}")
+    col2.metric("Accepted", f"{summary['accepted']:,}")
+    col3.metric("Skipped", f"{summary['skipped']:,}")
+    col4.metric("Errors", f"{summary['errors']:,}")
+
+    st.markdown("### Query Config")
+    st.json(display["query_config"], expanded=False)
+
+    st.markdown("### Accepted Examples")
+    if display["accepted"].empty:
+        st.info("No accepted examples.")
+    else:
+        st.dataframe(display["accepted"], use_container_width=True, hide_index=True)
+
+    st.markdown("### Skipped Examples")
+    if display["skipped"].empty:
+        st.info("No skipped examples.")
+    else:
+        st.dataframe(display["skipped"], use_container_width=True, hide_index=True)
+
+    if not display["errors"].empty:
+        st.markdown("### Error Examples")
+        st.dataframe(display["errors"], use_container_width=True, hide_index=True)
+
+    if display["warnings"]:
+        st.warning("\n".join(str(warning) for warning in display["warnings"]))
+
+
+def render_ingestion_result(result: UiIngestionResult) -> None:
+    summary = ingestion_result_summary(result)
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Processed", f"{summary['processed']:,}")
+    col2.metric("Stored", f"{summary['stored']:,}")
+    col3.metric("Skipped", f"{summary['skipped_invalid']:,}")
+    col4.metric("Failed", f"{summary['failed']:,}")
+
+    detail_col1, detail_col2, detail_col3, detail_col4 = st.columns(4)
+    detail_col1.metric("Updated", f"{summary['updated']:,}")
+    detail_col2.metric("Warnings", f"{summary['warnings']:,}")
+    detail_col3.metric("Seconds", f"{summary['duration_seconds']:.2f}")
+    detail_col4.metric("Run ID", summary["ingestion_run_id"] or "-")
+
+    if result.dry_run:
+        st.info("Dry-run ingestion completed without writing records.")
+    elif result.failed > 0:
+        st.warning("Ingestion completed with failed rows.")
+    else:
+        st.success("Ingestion completed and records were written.")
+    st.caption("Refresh Browse Results to see newly ingested records.")
+
+
 def _source_record_from_form(
     *,
     source_name: str,
@@ -602,6 +707,123 @@ def render_upload_tab(selected_endpoint: EndpointConfig) -> None:
                 st.error(f"hERG IC50 CSV import failed: {exc}")
 
 
+def render_ingest_tab(selected_endpoint: EndpointConfig) -> None:
+    st.subheader("Ingest Source Rows")
+    st.caption(f"Endpoint: {endpoint_label(selected_endpoint)}")
+
+    source_names = sorted(str(source_name) for source_name in selected_endpoint.source_configs)
+    if not source_names:
+        st.info("No source configs are available for this endpoint.")
+        return
+
+    key_prefix = f"ingest_{selected_endpoint.endpoint_key}"
+    selected_source = st.selectbox("Source", options=source_names, key=f"{key_prefix}_source")
+
+    config_col1, config_col2 = st.columns(2)
+    with config_col1:
+        request_timeout_seconds = st.number_input(
+            "Request timeout seconds",
+            min_value=1,
+            max_value=300,
+            value=45,
+            step=1,
+            key=f"{key_prefix}_timeout",
+        )
+    with config_col2:
+        http_retries = st.number_input(
+            "HTTP retries",
+            min_value=0,
+            max_value=10,
+            value=4,
+            step=1,
+            key=f"{key_prefix}_retries",
+        )
+
+    st.markdown("### Preview Source Rows")
+    preview_limit = st.number_input(
+        "Preview limit",
+        min_value=1,
+        max_value=200,
+        value=20,
+        step=1,
+        key=f"{key_prefix}_preview_limit",
+    )
+    if st.button("Preview source rows", key=f"{key_prefix}_preview_button"):
+        try:
+            with st.spinner("Previewing source rows..."):
+                with get_conn() as conn:
+                    preview_result = preview_endpoint_source(
+                        conn,
+                        endpoint_key=selected_endpoint.endpoint_key,
+                        source_name=selected_source,
+                        limit=int(preview_limit),
+                        http_config=HttpConfig(
+                            request_timeout_seconds=int(request_timeout_seconds),
+                            http_retries=int(http_retries),
+                        ),
+                    )
+            render_preview_result(preview_result)
+        except Exception as exc:
+            st.error(f"Preview failed: {exc}")
+
+    st.markdown("### Run Ingestion")
+    dry_run = st.checkbox("Dry run", value=True, key=f"{key_prefix}_dry_run")
+    limit_records = st.checkbox("Limit records", value=True, key=f"{key_prefix}_limit_records")
+    ingestion_col1, ingestion_col2 = st.columns(2)
+    with ingestion_col1:
+        max_records = st.number_input(
+            "Max records",
+            min_value=1,
+            max_value=250000,
+            value=100,
+            step=10,
+            disabled=not limit_records,
+            key=f"{key_prefix}_max_records",
+        )
+    with ingestion_col2:
+        commit_every = st.number_input(
+            "Commit every",
+            min_value=1,
+            max_value=10000,
+            value=500,
+            step=50,
+            key=f"{key_prefix}_commit_every",
+        )
+    fail_fast = st.checkbox("Fail fast", value=False, key=f"{key_prefix}_fail_fast")
+
+    confirmed_write = True
+    if not dry_run:
+        confirmed_write = st.checkbox(
+            "I understand this will write records to the database.",
+            value=False,
+            key=f"{key_prefix}_confirm_write",
+        )
+        if not confirmed_write:
+            st.warning("Write ingestion requires confirmation.")
+
+    if st.button(
+        "Run ingestion",
+        disabled=not dry_run and not confirmed_write,
+        key=f"{key_prefix}_run_button",
+    ):
+        request = UiIngestionRequest(
+            endpoint_key=selected_endpoint.endpoint_key,
+            source_name=selected_source,
+            dry_run=bool(dry_run),
+            max_records=int(max_records) if limit_records else None,
+            commit_every=int(commit_every),
+            fail_fast=bool(fail_fast),
+            request_timeout_seconds=int(request_timeout_seconds),
+            http_retries=int(http_retries),
+        )
+        try:
+            with st.spinner("Running ingestion..."):
+                result = run_ui_ingestion(request)
+            render_ingestion_result(result)
+        except Exception as exc:
+            st.error(f"Ingestion failed: {exc}")
+
+
 def render_browse_tab(selected_endpoint: EndpointConfig) -> None:
     st.subheader("Browse Results")
     st.caption(f"Endpoint: {endpoint_label(selected_endpoint)}")
@@ -792,8 +1014,8 @@ def main() -> None:
     )
     selected_endpoint = endpoints[labels.index(selected_label)]
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["Add Compound", "Add Measurement", "Upload CSV", "Browse Results", "Dashboard"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["Add Compound", "Add Measurement", "Upload CSV", "Ingest", "Browse Results", "Dashboard"]
     )
 
     with tab1:
@@ -803,8 +1025,10 @@ def main() -> None:
     with tab3:
         render_upload_tab(selected_endpoint)
     with tab4:
-        render_browse_tab(selected_endpoint)
+        render_ingest_tab(selected_endpoint)
     with tab5:
+        render_browse_tab(selected_endpoint)
+    with tab6:
         render_dashboard_tab(selected_endpoint)
 
 
