@@ -1,20 +1,22 @@
-import math
+from __future__ import annotations
+
 import uuid
-from typing import Dict, List, Optional
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 from psycopg.errors import UniqueViolation
 
-from herg.db import get_conn, upsert_compound, upsert_ic50_result, upsert_source_record
-from herg.read_db import (
-    fetch_compounds,
-    fetch_dashboard_data,
-    fetch_dashboard_metrics,
-    fetch_results,
-    fetch_results_count,
-    resolve_compound_id,
+from bioactivity.db import upsert_bioactivity_result
+from bioactivity.endpoints import EndpointConfig, list_active_endpoints, load_endpoint
+from bioactivity.models import MeasurementInput, measurement_from_ic50
+from bioactivity.results import (
+    count_bioactivity_results,
+    fetch_bioactivity_results,
+    format_bioactivity_result_row,
+    manual_entry_schema,
 )
+from herg.db import get_conn, upsert_compound, upsert_ic50_result, upsert_source_record
 from herg.models import CompoundInput, Ic50Input, SourceRecordInput
 from herg.normalize import (
     build_identifier_inputs,
@@ -25,12 +27,10 @@ from herg.normalize import (
     parse_optional_positive_int,
     parse_pipe_or_comma_names,
 )
+from herg.read_db import fetch_compounds, resolve_compound_id
 
 
-st.set_page_config(page_title="hERG IC50 Database", layout="wide")
-
-
-def build_compound_label(compound: Dict) -> str:
+def build_compound_label(compound: dict[str, Any]) -> str:
     compound_id = compound.get("compound_id")
     preferred_name = clean_text(compound.get("preferred_name"))
     chembl_id = clean_text(compound.get("chembl_id"))
@@ -58,7 +58,23 @@ def build_compound_label(compound: Dict) -> str:
     return f"{label} (id={compound_id})"
 
 
-def import_compounds_csv(df: pd.DataFrame) -> Dict:
+def endpoint_label(endpoint: EndpointConfig) -> str:
+    return f"{endpoint.display_name} ({endpoint.endpoint_key})"
+
+
+def load_active_endpoint_options() -> list[EndpointConfig]:
+    with get_conn() as conn:
+        return list_active_endpoints(conn)
+
+
+def _default_endpoint_index(endpoints: list[EndpointConfig]) -> int:
+    for index, endpoint in enumerate(endpoints):
+        if endpoint.endpoint_key == "herg_ic50":
+            return index
+    return 0
+
+
+def import_compounds_csv(df: pd.DataFrame) -> dict[str, Any]:
     normalized = df.copy()
     normalized.columns = [str(col).strip().lower() for col in normalized.columns]
 
@@ -81,7 +97,7 @@ def import_compounds_csv(df: pd.DataFrame) -> Dict:
         raise ValueError("CSV has no data rows.")
 
     records = normalized.to_dict(orient="records")
-    errors: List[Dict] = []
+    errors: list[dict[str, Any]] = []
     imported = 0
 
     with get_conn() as conn, conn.cursor() as cur:
@@ -97,7 +113,7 @@ def import_compounds_csv(df: pd.DataFrame) -> Dict:
                 preferred_name = clean_text(record.get("preferred_name"))
                 aliases = parse_pipe_or_comma_names(record.get("common_names"))
 
-                pubchem_cid_value: Optional[int] = None
+                pubchem_cid_value: int | None = None
                 pubchem_text = clean_text(record.get("pubchem_cid"))
                 if pubchem_text:
                     pubchem_cid_value = parse_optional_positive_int(pubchem_text)
@@ -133,7 +149,44 @@ def import_compounds_csv(df: pd.DataFrame) -> Dict:
     return {"total": len(records), "imported": imported, "failed": len(errors), "errors": errors}
 
 
-def import_ic50_csv(df: pd.DataFrame) -> Dict:
+def _upsert_herg_bioactivity_result(
+    cur: Any,
+    *,
+    endpoint: EndpointConfig,
+    compound_id: int,
+    source_record_id: int,
+    source_record_key: str,
+    measurement: Ic50Input,
+    entry_path: str,
+) -> tuple[int, dict[str, Any]]:
+    legacy_result = upsert_ic50_result(
+        cur=cur,
+        compound_id=compound_id,
+        source_record_id=source_record_id,
+        measurement=measurement,
+    )
+    bioactivity_result_id = upsert_bioactivity_result(
+        cur,
+        endpoint_id=endpoint.endpoint_id,
+        compound_id=compound_id,
+        source_record_id=source_record_id,
+        ingestion_run_id=None,
+        measurement=measurement_from_ic50(
+            result_key=source_record_key,
+            ic50_value=measurement.ic50_value,
+            ic50_unit=measurement.ic50_unit,
+            qualifier=measurement.qualifier,
+            ic50_um=legacy_result["ic50_um"],
+            pic50=legacy_result["pic50"],
+            pic50_qualifier=legacy_result["pic50_qualifier"],
+            assay_context={"entry_path": entry_path},
+            quality_flags={"entry_path": entry_path},
+        ),
+    )
+    return bioactivity_result_id, legacy_result
+
+
+def import_ic50_csv(df: pd.DataFrame) -> dict[str, Any]:
     normalized = df.copy()
     normalized.columns = [str(col).strip().lower() for col in normalized.columns]
 
@@ -159,10 +212,11 @@ def import_ic50_csv(df: pd.DataFrame) -> Dict:
         raise ValueError("CSV has no data rows.")
 
     records = normalized.to_dict(orient="records")
-    errors: List[Dict] = []
+    errors: list[dict[str, Any]] = []
     imported = 0
 
     with get_conn() as conn, conn.cursor() as cur:
+        herg_endpoint = load_endpoint(cur, "herg_ic50")
         for row_index, record in enumerate(records, start=2):
             cur.execute("SAVEPOINT csv_row")
             try:
@@ -205,7 +259,6 @@ def import_ic50_csv(df: pd.DataFrame) -> Dict:
                     source_release=source_release,
                     source_url=source_url,
                 )
-
                 source_record_id = upsert_source_record(cur, source_input)
 
                 measurement = Ic50Input(
@@ -214,12 +267,14 @@ def import_ic50_csv(df: pd.DataFrame) -> Dict:
                     qualifier=qualifier,
                     endpoint="IC50",
                 )
-
-                upsert_ic50_result(
-                    cur=cur,
+                _upsert_herg_bioactivity_result(
+                    cur,
+                    endpoint=herg_endpoint,
                     compound_id=compound_id,
                     source_record_id=source_record_id,
+                    source_record_key=source_record_key,
                     measurement=measurement,
+                    entry_path="streamlit_csv_import",
                 )
                 cur.execute("RELEASE SAVEPOINT csv_row")
                 imported += 1
@@ -254,7 +309,7 @@ def build_histogram_counts(series: pd.Series, bins: int) -> pd.DataFrame:
     )
 
 
-def render_import_summary(entity: str, summary: Dict) -> None:
+def render_import_summary(entity: str, summary: dict[str, Any]) -> None:
     st.info(
         f"{entity}: imported {summary['imported']} of {summary['total']} rows "
         f"({summary['failed']} failed)."
@@ -264,14 +319,62 @@ def render_import_summary(entity: str, summary: Dict) -> None:
         st.dataframe(pd.DataFrame(summary["errors"]), use_container_width=True, hide_index=True)
 
 
-st.title("hERG IC50 Database")
-st.write("Use this interface to manually upload results and browse the data.")
+def _format_results_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    formatted_rows = [format_bioactivity_result_row(row) for row in rows]
+    return pd.DataFrame(formatted_rows)
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Add Compound", "Add IC50 Result", "Upload CSV", "Browse Results", "Dashboard"]
-)
 
-with tab1:
+def _source_record_from_form(
+    *,
+    source_name: str,
+    source_record_key: str,
+    source_release: str,
+    source_url: str,
+    record_type: str,
+) -> SourceRecordInput:
+    source_name_value = clean_text(source_name)
+    if not source_name_value:
+        raise ValueError("source_name is required.")
+
+    source_record_key_value = clean_text(source_record_key)
+    if not source_record_key_value:
+        source_record_key_value = f"manual:{uuid.uuid4()}"
+
+    return SourceRecordInput(
+        source_name=source_name_value,
+        source_record_key=source_record_key_value,
+        record_type=record_type,
+        source_release=clean_text(source_release),
+        source_url=clean_text(source_url),
+    )
+
+
+def _measurement_from_concentration_form(
+    *,
+    source_record_key: str,
+    measurement_type: str,
+    value: float,
+    unit: str,
+    relation: str,
+    canonical_unit: str | None,
+) -> MeasurementInput:
+    same_unit_as_canonical = bool(canonical_unit and unit == canonical_unit)
+    return MeasurementInput(
+        result_key=source_record_key,
+        measurement_type=measurement_type,
+        value_kind="concentration",
+        original_value=value,
+        original_unit=unit,
+        original_relation=relation,
+        standard_value=value if same_unit_as_canonical else None,
+        standard_unit=canonical_unit if same_unit_as_canonical else None,
+        standard_relation=relation if same_unit_as_canonical else None,
+        assay_context={"entry_path": "streamlit_manual_entry"},
+        quality_flags={"entry_path": "streamlit_manual_entry"},
+    )
+
+
+def render_compound_tab() -> None:
     st.subheader("Register Compound")
     with st.form("compound_form", clear_on_submit=True):
         a_number = st.text_input("A-number (optional)", max_chars=100)
@@ -295,7 +398,7 @@ with tab1:
         preferred_name_value = clean_text(preferred_name)
         aliases_value = parse_pipe_or_comma_names(aliases_text)
 
-        pubchem_cid_value: Optional[int] = None
+        pubchem_cid_value: int | None = None
         input_error = False
         pubchem_text = clean_text(pubchem_cid_text)
         if pubchem_text:
@@ -334,107 +437,105 @@ with tab1:
             except Exception as exc:
                 st.error(f"Failed to save compound: {exc}")
 
-with tab2:
-    st.subheader("Add IC50 Result")
+
+def render_measurement_tab(selected_endpoint: EndpointConfig) -> None:
+    st.subheader("Add Bioactivity Measurement")
+    st.caption(f"Endpoint: {endpoint_label(selected_endpoint)}")
+
+    schema = manual_entry_schema(selected_endpoint)
+    if not schema.supported:
+        st.info(schema.message)
+        return
+
     compounds = fetch_compounds()
     if not compounds:
         st.info("No compounds found yet. Add at least one compound first.")
-    else:
-        compound_options = {build_compound_label(c): c["compound_id"] for c in compounds}
-        with st.form("result_form", clear_on_submit=True):
-            compound_label = st.selectbox("Compound", options=list(compound_options.keys()))
-            ic50_value = st.number_input("IC50 Value", min_value=0.000001, value=100.0, step=1.0, format="%.6f")
-            ic50_unit = st.selectbox("IC50 Unit", options=["pM", "nM", "uM", "mM"], index=1)
-            qualifier = st.selectbox("Qualifier", options=["=", "<", ">"], index=0)
-            source_name = st.text_input("Source name", value="manual")
-            source_record_key = st.text_input("Source record key (optional)")
-            source_release = st.text_input("Source release (optional)")
-            source_url = st.text_input("Source URL (optional)")
-            submitted_result = st.form_submit_button("Save IC50 Result")
+        return
 
-        if submitted_result:
-            try:
-                source_name_value = clean_text(source_name)
-                if not source_name_value:
-                    raise ValueError("source_name is required.")
+    compound_options = {build_compound_label(c): c["compound_id"] for c in compounds}
+    unit_options = schema.allowed_units or ([schema.canonical_unit] if schema.canonical_unit else ["uM"])
+    relation_options = schema.allowed_relations or ["=", "<", ">"]
+    unit_index = unit_options.index(schema.canonical_unit) if schema.canonical_unit in unit_options else 0
+    measurement_label = schema.measurement_type or selected_endpoint.display_name
 
-                source_record_key_value = clean_text(source_record_key)
-                if not source_record_key_value:
-                    source_record_key_value = f"manual:{uuid.uuid4()}"
+    with st.form("result_form", clear_on_submit=True):
+        compound_label = st.selectbox("Compound", options=list(compound_options.keys()))
+        measurement_value = st.number_input(
+            f"{measurement_label} value",
+            min_value=0.000001,
+            value=100.0,
+            step=1.0,
+            format="%.6f",
+        )
+        measurement_unit = st.selectbox(f"{measurement_label} unit", options=unit_options, index=unit_index)
+        relation = st.selectbox("Relation", options=relation_options, index=0)
+        source_name = st.text_input("Source name", value="manual")
+        source_record_key = st.text_input("Source record key (optional)")
+        source_release = st.text_input("Source release (optional)")
+        source_url = st.text_input("Source URL (optional)")
+        submitted_result = st.form_submit_button("Save Measurement")
 
-                source_input = SourceRecordInput(
-                    source_name=source_name_value,
-                    source_record_key=source_record_key_value,
-                    record_type="manual_entry",
-                    source_release=clean_text(source_release),
-                    source_url=clean_text(source_url),
-                )
+    if not submitted_result:
+        return
 
+    try:
+        source_input = _source_record_from_form(
+            source_name=source_name,
+            source_record_key=source_record_key,
+            source_release=source_release,
+            source_url=source_url,
+            record_type="manual_entry",
+        )
+        compound_id = int(compound_options[compound_label])
+
+        with get_conn() as conn, conn.cursor() as cur:
+            source_record_id = upsert_source_record(cur, source_input)
+            if selected_endpoint.endpoint_key == "herg_ic50":
                 measurement = Ic50Input(
-                    ic50_value=float(ic50_value),
-                    ic50_unit=normalize_ic50_unit(ic50_unit),
-                    qualifier=normalize_qualifier(qualifier),
+                    ic50_value=float(measurement_value),
+                    ic50_unit=normalize_ic50_unit(measurement_unit),
+                    qualifier=normalize_qualifier(relation),
                     endpoint="IC50",
                 )
-
-                with get_conn() as conn, conn.cursor() as cur:
-                    source_record_id = upsert_source_record(cur, source_input)
-                    result = upsert_ic50_result(
-                        cur,
-                        compound_options[compound_label],
-                        source_record_id,
-                        measurement,
-                    )
-
+                bioactivity_result_id, legacy_result = _upsert_herg_bioactivity_result(
+                    cur,
+                    endpoint=selected_endpoint,
+                    compound_id=compound_id,
+                    source_record_id=source_record_id,
+                    source_record_key=source_input.source_record_key,
+                    measurement=measurement,
+                    entry_path="streamlit_manual_entry",
+                )
                 st.success(
-                    f"Result #{result['result_id']} saved. "
-                    f"ic50_um={result['ic50_um']}, pIC50={result['pic50']} "
-                    f"(qualifier {result['pic50_qualifier']})."
+                    f"Result #{bioactivity_result_id} saved. "
+                    f"IC50={legacy_result['ic50_um']} uM, pIC50={legacy_result['pic50']} "
+                    f"(relation {legacy_result['pic50_qualifier']})."
                 )
-            except Exception as exc:
-                st.error(f"Failed to save IC50 result: {exc}")
-
-with tab4:
-    st.subheader("Browse Results")
-    limit = st.slider("Rows to preview", min_value=10, max_value=1000, value=100, step=10)
-    try:
-        total_results = fetch_results_count()
-        results_df = fetch_results(limit)
-        if total_results == 0 or results_df.empty:
-            st.info("No IC50 results found yet.")
-        else:
-            st.caption(
-                f"Previewing {len(results_df):,} of {total_results:,} rows. "
-                "The on-screen table stays capped for performance."
-            )
-            st.dataframe(results_df, use_container_width=True, hide_index=True)
-            st.download_button(
-                label="Download preview CSV",
-                data=results_df.to_csv(index=False).encode("utf-8"),
-                file_name="ic50_results_preview.csv",
-                mime="text/csv",
-            )
-
-            prepare_full_export = st.checkbox(
-                "Prepare full CSV export",
-                help="Load every row from the database and make it available as a CSV download.",
-            )
-            if prepare_full_export:
-                with st.spinner("Preparing full results export..."):
-                    full_results_df = fetch_results(limit=None)
-                st.caption(f"Full export contains {len(full_results_df):,} rows.")
-                st.download_button(
-                    label="Download full results CSV",
-                    data=full_results_df.to_csv(index=False).encode("utf-8"),
-                    file_name="ic50_results_all.csv",
-                    mime="text/csv",
+            else:
+                measurement = _measurement_from_concentration_form(
+                    source_record_key=source_input.source_record_key,
+                    measurement_type=schema.measurement_type,
+                    value=float(measurement_value),
+                    unit=measurement_unit,
+                    relation=relation,
+                    canonical_unit=schema.canonical_unit,
                 )
+                bioactivity_result_id = upsert_bioactivity_result(
+                    cur,
+                    endpoint_id=selected_endpoint.endpoint_id,
+                    compound_id=compound_id,
+                    source_record_id=source_record_id,
+                    ingestion_run_id=None,
+                    measurement=measurement,
+                )
+                st.success(f"Result #{bioactivity_result_id} saved for {selected_endpoint.display_name}.")
     except Exception as exc:
-        st.error(f"Failed to load results: {exc}")
+        st.error(f"Failed to save measurement: {exc}")
 
-with tab3:
+
+def render_upload_tab(selected_endpoint: EndpointConfig) -> None:
     st.subheader("Upload CSV")
-    st.write("Bulk upload compounds and IC50 results directly from CSV files.")
+    st.write("Bulk upload compounds and hERG IC50 result rows directly from CSV files.")
 
     compounds_template = (
         "a_number,unii,pubchem_cid,chembl_id,standard_inchikey,standard_inchi,canonical_smiles,preferred_name,common_names\n"
@@ -450,12 +551,6 @@ with tab3:
         label="Download compounds CSV template",
         data=compounds_template.encode("utf-8"),
         file_name="compounds_template.csv",
-        mime="text/csv",
-    )
-    st.download_button(
-        label="Download IC50 CSV template",
-        data=ic50_template.encode("utf-8"),
-        file_name="ic50_template.csv",
         mime="text/csv",
     )
 
@@ -477,47 +572,88 @@ with tab3:
             except Exception as exc:
                 st.error(f"Compounds CSV import failed: {exc}")
 
-    st.markdown("### Import IC50 CSV")
+    st.markdown("### Import hERG IC50 CSV")
+    st.info("Result CSV import is currently limited to the hERG IC50 endpoint.")
+    if selected_endpoint.endpoint_key != "herg_ic50":
+        st.caption("Select hERG IC50 to import result CSV rows.")
+        return
+
+    st.download_button(
+        label="Download hERG IC50 CSV template",
+        data=ic50_template.encode("utf-8"),
+        file_name="herg_ic50_template.csv",
+        mime="text/csv",
+    )
     st.caption(
         "Expected columns: id_type, id_value, ic50_value, ic50_unit, qualifier, "
         "source_name, source_record_key, source_release, source_url"
     )
-    uploaded_ic50 = st.file_uploader("Choose IC50 CSV", type=["csv"], key="upload_ic50_csv")
-    if st.button("Import IC50 CSV", key="import_ic50_btn"):
+    uploaded_ic50 = st.file_uploader("Choose hERG IC50 CSV", type=["csv"], key="upload_ic50_csv")
+    if st.button("Import hERG IC50 CSV", key="import_ic50_btn"):
         if uploaded_ic50 is None:
-            st.error("Please choose an IC50 CSV file first.")
+            st.error("Please choose a hERG IC50 CSV file first.")
         else:
             try:
                 uploaded_ic50.seek(0)
                 ic50_df = pd.read_csv(uploaded_ic50)
                 summary = import_ic50_csv(ic50_df)
-                render_import_summary("IC50 results", summary)
+                render_import_summary("hERG IC50 results", summary)
             except Exception as exc:
-                st.error(f"IC50 CSV import failed: {exc}")
+                st.error(f"hERG IC50 CSV import failed: {exc}")
 
-with tab5:
-    st.subheader("Data Dashboard")
-    st.write("Summary metrics and distribution views for loaded IC50 records.")
+
+def render_browse_tab(selected_endpoint: EndpointConfig) -> None:
+    st.subheader("Browse Results")
+    st.caption(f"Endpoint: {endpoint_label(selected_endpoint)}")
+    limit = st.slider("Rows to preview", min_value=10, max_value=1000, value=100, step=10)
 
     try:
-        metrics = fetch_dashboard_metrics()
-    except Exception as exc:
-        st.error(f"Failed to load dashboard metrics: {exc}")
-        metrics = None
+        with get_conn() as conn:
+            total_results = count_bioactivity_results(conn, selected_endpoint.endpoint_id)
+            rows = fetch_bioactivity_results(conn, endpoint_id=selected_endpoint.endpoint_id, limit=limit)
+        results_df = _format_results_dataframe(rows)
+        if total_results == 0 or results_df.empty:
+            st.info("No normalized bioactivity results found for this endpoint.")
+        else:
+            st.caption(
+                f"Previewing {len(results_df):,} of {total_results:,} bioactivity_results rows. "
+                "The on-screen table stays capped for performance."
+            )
+            st.dataframe(results_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                label="Download preview CSV",
+                data=results_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"{selected_endpoint.endpoint_key}_bioactivity_results_preview.csv",
+                mime="text/csv",
+            )
 
-    if metrics is not None:
-        metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
-        metric_col1.metric("Compounds", f"{metrics['compounds_n']:,}")
-        metric_col2.metric("IC50 Entries", f"{metrics['results_n']:,}")
-        metric_col3.metric("Compounds With Results", f"{metrics['compounds_with_results_n']:,}")
-        metric_col4.metric(
-            "First Entry",
-            metrics["first_result_at"].strftime("%Y-%m-%d") if metrics["first_result_at"] else "-",
-        )
-        metric_col5.metric(
-            "Latest Entry",
-            metrics["last_result_at"].strftime("%Y-%m-%d") if metrics["last_result_at"] else "-",
-        )
+            prepare_full_export = st.checkbox(
+                "Prepare full CSV export",
+                help="Load every row for the selected endpoint and make it available as a CSV download.",
+            )
+            if prepare_full_export:
+                with st.spinner("Preparing full results export..."):
+                    with get_conn() as conn:
+                        full_rows = fetch_bioactivity_results(
+                            conn,
+                            endpoint_id=selected_endpoint.endpoint_id,
+                            limit=None,
+                        )
+                    full_results_df = _format_results_dataframe(full_rows)
+                st.caption(f"Full export contains {len(full_results_df):,} rows.")
+                st.download_button(
+                    label="Download full results CSV",
+                    data=full_results_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{selected_endpoint.endpoint_key}_bioactivity_results_all.csv",
+                    mime="text/csv",
+                )
+    except Exception as exc:
+        st.error(f"Failed to load results: {exc}")
+
+
+def render_dashboard_tab(selected_endpoint: EndpointConfig) -> None:
+    st.subheader("Data Dashboard")
+    st.caption(f"Endpoint: {endpoint_label(selected_endpoint)}")
 
     max_rows = st.slider(
         "Rows to analyze",
@@ -525,119 +661,152 @@ with tab5:
         max_value=250000,
         value=20000,
         step=100,
-        help="Recent rows to pull from the database for visualization.",
+        help="Recent rows to pull from bioactivity_results for visualization.",
     )
 
     try:
-        dashboard_df = fetch_dashboard_data(limit=max_rows)
+        with get_conn() as conn:
+            total_results = count_bioactivity_results(conn, selected_endpoint.endpoint_id)
+            rows = fetch_bioactivity_results(conn, endpoint_id=selected_endpoint.endpoint_id, limit=max_rows)
+        dashboard_df = _format_results_dataframe(rows)
     except Exception as exc:
         st.error(f"Failed to load dashboard data: {exc}")
+        total_results = 0
         dashboard_df = pd.DataFrame()
 
     if dashboard_df.empty:
-        st.info("No IC50 data available yet.")
-    else:
-        dashboard_df["created_at"] = pd.to_datetime(dashboard_df["created_at"], errors="coerce")
-        dashboard_df["ic50_um"] = pd.to_numeric(dashboard_df["ic50_um"], errors="coerce")
-        dashboard_df["pic50"] = pd.to_numeric(dashboard_df["pic50"], errors="coerce")
-        dashboard_df["log10_ic50_um"] = dashboard_df["ic50_um"].apply(
-            lambda value: math.log10(value) if pd.notna(value) and value > 0 else None
+        st.info("No normalized bioactivity data available for this endpoint yet.")
+        return
+
+    metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
+    metric_col1.metric("Results", f"{total_results:,}")
+    metric_col2.metric("Loaded Rows", f"{len(dashboard_df):,}")
+    metric_col3.metric("Compounds", f"{dashboard_df['compound_id'].nunique():,}")
+    metric_col4.metric("Sources", f"{dashboard_df['source'].nunique():,}")
+    metric_col5.metric("Value Kinds", f"{dashboard_df['value_kind'].nunique():,}")
+
+    dashboard_df["created_at"] = pd.to_datetime(dashboard_df["created_at"], errors="coerce")
+    dashboard_df["standard_value_numeric"] = pd.to_numeric(dashboard_df["standard_value"], errors="coerce")
+    dashboard_df["p_value_numeric"] = pd.to_numeric(dashboard_df["p_value"], errors="coerce")
+
+    st.markdown("### Filters")
+    filter_col1, filter_col2 = st.columns(2)
+    with filter_col1:
+        source_options = sorted(dashboard_df["source"].dropna().astype(str).unique().tolist())
+        selected_sources = st.multiselect("Source", options=source_options, default=source_options)
+    with filter_col2:
+        value_kind_options = sorted(dashboard_df["value_kind"].dropna().astype(str).unique().tolist())
+        selected_value_kinds = st.multiselect(
+            "Value kind",
+            options=value_kind_options,
+            default=value_kind_options,
         )
 
-        st.markdown("### Filters")
-        filter_col1, filter_col2 = st.columns(2)
-        with filter_col1:
-            qualifier_options = sorted(dashboard_df["qualifier"].dropna().astype(str).unique().tolist())
-            selected_qualifiers = st.multiselect(
-                "Qualifier",
-                options=qualifier_options,
-                default=qualifier_options,
-            )
-        with filter_col2:
-            unit_options = sorted(dashboard_df["ic50_unit"].dropna().astype(str).unique().tolist())
-            selected_units = st.multiselect(
-                "Unit",
-                options=unit_options,
-                default=unit_options,
-            )
+    filtered_df = dashboard_df.copy()
+    if selected_sources:
+        filtered_df = filtered_df[filtered_df["source"].astype(str).isin(selected_sources)]
+    if selected_value_kinds:
+        filtered_df = filtered_df[filtered_df["value_kind"].astype(str).isin(selected_value_kinds)]
 
-        filtered_df = dashboard_df.copy()
-        if selected_qualifiers:
-            filtered_df = filtered_df[filtered_df["qualifier"].isin(selected_qualifiers)]
-        if selected_units:
-            filtered_df = filtered_df[filtered_df["ic50_unit"].isin(selected_units)]
+    st.caption(f"Visualizing {len(filtered_df):,} loaded rows after filters.")
+    if filtered_df.empty:
+        st.info("No data left after filtering.")
+        return
 
-        st.caption(f"Visualizing {len(filtered_df):,} rows after filters.")
+    st.markdown("### Category Distributions")
+    dist_col1, dist_col2 = st.columns(2)
+    with dist_col1:
+        st.caption("Value kind counts")
+        value_kind_counts = filtered_df["value_kind"].astype(str).value_counts().sort_index().reset_index()
+        value_kind_counts.columns = ["value_kind", "count"]
+        st.bar_chart(value_kind_counts.set_index("value_kind"))
+    with dist_col2:
+        st.caption("Measurement type counts")
+        measurement_counts = (
+            filtered_df["measurement_type"].astype(str).value_counts().sort_index().reset_index()
+        )
+        measurement_counts.columns = ["measurement_type", "count"]
+        st.bar_chart(measurement_counts.set_index("measurement_type"))
 
-        if filtered_df.empty:
-            st.info("No data left after filtering.")
+    concentration_df = filtered_df[filtered_df["value_kind"] == "concentration"].copy()
+    if not concentration_df.empty:
+        st.markdown("### Value Distributions")
+        value_col1, value_col2 = st.columns(2)
+        with value_col1:
+            st.caption("Standard value histogram")
+            standard_hist = build_histogram_counts(concentration_df["standard_value_numeric"], bins=30)
+            if standard_hist.empty:
+                st.info("No standardized numeric values.")
+            else:
+                st.bar_chart(standard_hist.set_index("bin_start")[["count"]])
+        with value_col2:
+            st.caption("p-value histogram")
+            p_value_hist = build_histogram_counts(concentration_df["p_value_numeric"], bins=30)
+            if p_value_hist.empty:
+                st.info("No p-values.")
+            else:
+                st.bar_chart(p_value_hist.set_index("bin_start")[["count"]])
+
+    st.markdown("### Trend and Top Compounds")
+    trend_col1, trend_col2 = st.columns(2)
+    with trend_col1:
+        st.caption("Entries per month")
+        monthly_counts = (
+            filtered_df.dropna(subset=["created_at"])
+            .assign(month=lambda df: df["created_at"].dt.to_period("M").astype(str))
+            .groupby("month")
+            .size()
+            .reset_index(name="count")
+            .sort_values("month")
+        )
+        if monthly_counts.empty:
+            st.info("No valid timestamps for trend plot.")
         else:
-            st.markdown("### Category Distributions")
-            dist_col1, dist_col2 = st.columns(2)
-            with dist_col1:
-                st.caption("Qualifier counts")
-                qualifier_counts = (
-                    filtered_df["qualifier"]
-                    .astype(str)
-                    .value_counts()
-                    .reindex(["=", "<", ">"], fill_value=0)
-                    .reset_index()
-                )
-                qualifier_counts.columns = ["qualifier", "count"]
-                st.bar_chart(qualifier_counts.set_index("qualifier"))
-            with dist_col2:
-                st.caption("Unit counts")
-                unit_counts = (
-                    filtered_df["ic50_unit"]
-                    .astype(str)
-                    .value_counts()
-                    .sort_index()
-                    .reset_index()
-                )
-                unit_counts.columns = ["unit", "count"]
-                st.bar_chart(unit_counts.set_index("unit"))
+            st.line_chart(monthly_counts.set_index("month"))
+    with trend_col2:
+        st.caption("Top compounds by entry count")
+        top_compounds = filtered_df["compound"].astype(str).value_counts().head(15).reset_index()
+        top_compounds.columns = ["compound", "count"]
+        st.bar_chart(top_compounds.set_index("compound"))
 
-            st.markdown("### Value Distributions")
-            value_col1, value_col2 = st.columns(2)
-            with value_col1:
-                st.caption("pIC50 histogram")
-                pic50_hist = build_histogram_counts(filtered_df["pic50"], bins=30)
-                if pic50_hist.empty:
-                    st.info("No valid pIC50 values.")
-                else:
-                    st.bar_chart(pic50_hist.set_index("bin_start")[["count"]])
-            with value_col2:
-                st.caption("log10(IC50 uM) histogram")
-                ic50_log_hist = build_histogram_counts(filtered_df["log10_ic50_um"], bins=30)
-                if ic50_log_hist.empty:
-                    st.info("No valid IC50 values.")
-                else:
-                    st.bar_chart(ic50_log_hist.set_index("bin_start")[["count"]])
 
-            st.markdown("### Trend and Top Compounds")
-            trend_col1, trend_col2 = st.columns(2)
-            with trend_col1:
-                st.caption("Entries per month")
-                monthly_counts = (
-                    filtered_df.dropna(subset=["created_at"])
-                    .assign(month=lambda df: df["created_at"].dt.to_period("M").astype(str))
-                    .groupby("month")
-                    .size()
-                    .reset_index(name="count")
-                    .sort_values("month")
-                )
-                if monthly_counts.empty:
-                    st.info("No valid timestamps for trend plot.")
-                else:
-                    st.line_chart(monthly_counts.set_index("month"))
-            with trend_col2:
-                st.caption("Top compounds by entry count")
-                top_compounds = (
-                    filtered_df["compound_label"]
-                    .astype(str)
-                    .value_counts()
-                    .head(15)
-                    .reset_index()
-                )
-                top_compounds.columns = ["compound", "count"]
-                st.bar_chart(top_compounds.set_index("compound"))
+def main() -> None:
+    st.set_page_config(page_title="Bioactivity Database", layout="wide")
+    st.title("Bioactivity Database")
+
+    try:
+        endpoints = load_active_endpoint_options()
+    except Exception as exc:
+        st.error(f"Failed to load active endpoints: {exc}")
+        st.stop()
+
+    if not endpoints:
+        st.error("No active endpoints found.")
+        st.stop()
+
+    labels = [endpoint_label(endpoint) for endpoint in endpoints]
+    selected_label = st.selectbox(
+        "Endpoint",
+        options=labels,
+        index=_default_endpoint_index(endpoints),
+    )
+    selected_endpoint = endpoints[labels.index(selected_label)]
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["Add Compound", "Add Measurement", "Upload CSV", "Browse Results", "Dashboard"]
+    )
+
+    with tab1:
+        render_compound_tab()
+    with tab2:
+        render_measurement_tab(selected_endpoint)
+    with tab3:
+        render_upload_tab(selected_endpoint)
+    with tab4:
+        render_browse_tab(selected_endpoint)
+    with tab5:
+        render_dashboard_tab(selected_endpoint)
+
+
+if __name__ == "__main__":
+    main()
