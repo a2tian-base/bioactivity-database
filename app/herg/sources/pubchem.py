@@ -71,14 +71,13 @@ def _normalize_pubchem_source_config(
 
     activity_name_regex = _required_config_text(source_config, "activity_name_regex")
     _compile_activity_name_regex(activity_name_regex)
+    batch_size_value = cid_batch_size if cid_batch_size is not None else source_config.get("cid_batch_size")
 
     return {
         "target_gene_symbol": _required_config_text(source_config, "target_gene_symbol"),
         "target_gene_id": _required_config_text(source_config, "target_gene_id"),
         "activity_name_regex": activity_name_regex,
-        "cid_batch_size": cid_batch_size
-        if cid_batch_size is not None
-        else _optional_positive_int(source_config.get("cid_batch_size"), DEFAULT_CID_BATCH_SIZE),
+        "cid_batch_size": _optional_positive_int(batch_size_value, DEFAULT_CID_BATCH_SIZE),
     }
 
 
