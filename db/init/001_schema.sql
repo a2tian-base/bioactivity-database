@@ -758,6 +758,107 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION upsert_bioactivity_result(
+    p_endpoint_id BIGINT,
+    p_compound_id BIGINT,
+    p_source_record_id BIGINT,
+    p_ingestion_run_id BIGINT DEFAULT NULL,
+    p_result_key TEXT DEFAULT NULL,
+    p_measurement_type TEXT DEFAULT NULL,
+    p_value_kind TEXT DEFAULT NULL,
+    p_original_value NUMERIC DEFAULT NULL,
+    p_original_unit TEXT DEFAULT NULL,
+    p_original_relation TEXT DEFAULT NULL,
+    p_standard_value NUMERIC DEFAULT NULL,
+    p_standard_unit TEXT DEFAULT NULL,
+    p_standard_relation TEXT DEFAULT NULL,
+    p_p_value NUMERIC DEFAULT NULL,
+    p_p_value_relation TEXT DEFAULT NULL,
+    p_value_text TEXT DEFAULT NULL,
+    p_assay_context JSONB DEFAULT '{}'::JSONB,
+    p_quality_flags JSONB DEFAULT '{}'::JSONB
+) RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_result_key TEXT := NULLIF(BTRIM(p_result_key), '');
+    v_measurement_type TEXT := NULLIF(BTRIM(p_measurement_type), '');
+    v_value_kind TEXT := NULLIF(BTRIM(p_value_kind), '');
+    v_assay_context JSONB := COALESCE(p_assay_context, '{}'::JSONB);
+    v_quality_flags JSONB := COALESCE(p_quality_flags, '{}'::JSONB);
+    v_result_id BIGINT;
+BEGIN
+    IF v_result_key IS NULL THEN
+        RAISE EXCEPTION 'result_key is required.';
+    END IF;
+
+    IF v_measurement_type IS NULL THEN
+        RAISE EXCEPTION 'measurement_type is required.';
+    END IF;
+
+    INSERT INTO bioactivity_results (
+        endpoint_id,
+        compound_id,
+        source_record_id,
+        ingestion_run_id,
+        result_key,
+        measurement_type,
+        value_kind,
+        original_value,
+        original_unit,
+        original_relation,
+        standard_value,
+        standard_unit,
+        standard_relation,
+        p_value,
+        p_value_relation,
+        value_text,
+        assay_context,
+        quality_flags
+    )
+    VALUES (
+        p_endpoint_id,
+        p_compound_id,
+        p_source_record_id,
+        p_ingestion_run_id,
+        v_result_key,
+        v_measurement_type,
+        v_value_kind,
+        p_original_value,
+        NULLIF(BTRIM(p_original_unit), ''),
+        NULLIF(BTRIM(p_original_relation), ''),
+        p_standard_value,
+        NULLIF(BTRIM(p_standard_unit), ''),
+        NULLIF(BTRIM(p_standard_relation), ''),
+        p_p_value,
+        NULLIF(BTRIM(p_p_value_relation), ''),
+        NULLIF(BTRIM(p_value_text), ''),
+        v_assay_context,
+        v_quality_flags
+    )
+    ON CONFLICT (endpoint_id, source_record_id, result_key)
+    DO UPDATE SET
+        compound_id = EXCLUDED.compound_id,
+        ingestion_run_id = EXCLUDED.ingestion_run_id,
+        measurement_type = EXCLUDED.measurement_type,
+        value_kind = EXCLUDED.value_kind,
+        original_value = EXCLUDED.original_value,
+        original_unit = EXCLUDED.original_unit,
+        original_relation = EXCLUDED.original_relation,
+        standard_value = EXCLUDED.standard_value,
+        standard_unit = EXCLUDED.standard_unit,
+        standard_relation = EXCLUDED.standard_relation,
+        p_value = EXCLUDED.p_value,
+        p_value_relation = EXCLUDED.p_value_relation,
+        value_text = EXCLUDED.value_text,
+        assay_context = EXCLUDED.assay_context,
+        quality_flags = EXCLUDED.quality_flags
+    RETURNING bioactivity_results.result_id INTO v_result_id;
+
+    RETURN v_result_id;
+END;
+$$;
+
 CREATE OR REPLACE VIEW compound_summary_v AS
 SELECT
     c.compound_id,
