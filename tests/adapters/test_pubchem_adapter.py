@@ -88,6 +88,19 @@ def test_pubchem_adapter_from_source_config_matches_explicit_herg_config(monkeyp
     assert configured_adapter.effective_config == explicit_adapter.effective_config
 
 
+@pytest.mark.parametrize("cid_batch_size", [0, -1])
+def test_pubchem_adapter_from_source_config_rejects_invalid_runtime_cid_batch_size(cid_batch_size):
+    endpoint = _herg_ic50_endpoint()
+
+    with pytest.raises(ValueError, match="Expected positive integer"):
+        PubChemAdapter.from_source_config(
+            endpoint,
+            get_source_config(endpoint, "pubchem"),
+            http_config=HttpConfig(request_timeout_seconds=1, http_retries=0),
+            cid_batch_size=cid_batch_size,
+        )
+
+
 def test_pubchem_adapter_from_source_config_rejects_missing_target_gene_symbol():
     endpoint = _herg_ic50_endpoint()
     source_config = get_source_config(endpoint, "pubchem")
