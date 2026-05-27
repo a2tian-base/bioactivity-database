@@ -174,6 +174,43 @@ def load_endpoint(
         )
 
 
+def list_active_endpoints(conn_or_cur: psycopg.Connection | psycopg.Cursor) -> list[EndpointConfig]:
+    def _list_from_cursor(cur: psycopg.Cursor) -> list[EndpointConfig]:
+        cur.execute(
+            """
+            SELECT
+                endpoint_id,
+                endpoint_key,
+                display_name,
+                spec,
+                source_configs,
+                spec_hash,
+                active
+            FROM endpoints
+            WHERE active
+            ORDER BY display_name, endpoint_key
+            """
+        )
+        return [
+            _validate_endpoint(
+                endpoint_id=row[0],
+                endpoint_key=row[1],
+                display_name=row[2],
+                spec=row[3],
+                source_configs=row[4],
+                spec_hash=row[5],
+                active=row[6],
+            )
+            for row in cur.fetchall()
+        ]
+
+    if hasattr(conn_or_cur, "fetchall"):
+        return _list_from_cursor(conn_or_cur)
+
+    with conn_or_cur.cursor() as cur:
+        return _list_from_cursor(cur)
+
+
 def get_source_config(endpoint: EndpointConfig, source_name: str) -> dict[str, Any]:
     clean_source_name = _clean_text(source_name).lower()
     if not clean_source_name:
