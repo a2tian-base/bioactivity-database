@@ -25,6 +25,17 @@ class MissingSourceConfigError(EndpointConfigError):
     pass
 
 
+_ENDPOINT_COLUMNS = (
+    "endpoint_id",
+    "endpoint_key",
+    "display_name",
+    "spec",
+    "source_configs",
+    "spec_hash",
+    "active",
+)
+
+
 @dataclass(frozen=True)
 class EndpointConfig:
     endpoint_id: int
@@ -109,6 +120,13 @@ def _validate_endpoint(
     )
 
 
+def _endpoint_row_data(row: object) -> dict[str, Any]:
+    if isinstance(row, Mapping):
+        return {column: row[column] for column in _ENDPOINT_COLUMNS}
+
+    return dict(zip(_ENDPOINT_COLUMNS, row, strict=True))
+
+
 def _load_endpoint_from_cursor(
     cur: psycopg.Cursor,
     endpoint_key: str,
@@ -134,18 +152,18 @@ def _load_endpoint_from_cursor(
     if row is None:
         raise EndpointNotFoundError(f"Endpoint '{endpoint_key}' was not found.")
 
-    endpoint_id, row_key, display_name, spec, source_configs, spec_hash, active = row
-    if not bool(active) and not include_inactive:
-        raise InactiveEndpointError(f"Endpoint '{row_key}' is inactive.")
+    row_data = _endpoint_row_data(row)
+    if not bool(row_data["active"]) and not include_inactive:
+        raise InactiveEndpointError(f"Endpoint '{row_data['endpoint_key']}' is inactive.")
 
     return _validate_endpoint(
-        endpoint_id=endpoint_id,
-        endpoint_key=row_key,
-        display_name=display_name,
-        spec=spec,
-        source_configs=source_configs,
-        spec_hash=spec_hash,
-        active=active,
+        endpoint_id=row_data["endpoint_id"],
+        endpoint_key=row_data["endpoint_key"],
+        display_name=row_data["display_name"],
+        spec=row_data["spec"],
+        source_configs=row_data["source_configs"],
+        spec_hash=row_data["spec_hash"],
+        active=row_data["active"],
     )
 
 
