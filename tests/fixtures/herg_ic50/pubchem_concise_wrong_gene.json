@@ -1,0 +1,10 @@
+{
+  "AID": "10",
+  "SID": "11",
+  "CID": "12",
+  "Target GeneID": "9999",
+  "Activity Name": "IC50",
+  "Activity Value [uM]": "1.2",
+  "Activity Outcome": "Active",
+  "Assay Name": "Wrong Target Assay"
+}

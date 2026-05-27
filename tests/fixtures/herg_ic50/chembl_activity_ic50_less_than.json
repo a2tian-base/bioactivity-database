@@ -1,0 +1,9 @@
+{
+  "activity_id": 124,
+  "assay_chembl_id": "CHEMBL124",
+  "molecule_chembl_id": "CHEMBL25",
+  "standard_relation": "<",
+  "standard_value": "25",
+  "standard_units": "nM",
+  "data_validity_comment": null
+}
