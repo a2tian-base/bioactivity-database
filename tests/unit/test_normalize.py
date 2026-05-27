@@ -18,16 +18,34 @@ def test_clean_text_handles_nulls():
     assert clean_text("nan") == ""
 
 
-def test_normalize_ic50_unit():
-    assert normalize_ic50_unit("nM") == "nM"
-    assert normalize_ic50_unit("um") == "uM"
-    assert normalize_ic50_unit("\u00b5M") == "uM"
+@pytest.mark.parametrize(
+    ("raw_unit", "expected"),
+    [
+        ("pM", "pM"),
+        ("pm", "pM"),
+        ("nM", "nM"),
+        ("uM", "uM"),
+        ("um", "uM"),
+        ("\u00b5M", "uM"),
+        ("\u03bcM", "uM"),
+        ("mM", "mM"),
+    ],
+)
+def test_normalize_ic50_unit(raw_unit, expected):
+    assert normalize_ic50_unit(raw_unit) == expected
+
+
+def test_normalize_ic50_unit_rejects_unknown_unit():
     with pytest.raises(ValueError):
         normalize_ic50_unit("kg")
 
 
-def test_normalize_qualifier():
-    assert normalize_qualifier("=") == "="
+@pytest.mark.parametrize("qualifier", ["=", "<", ">"])
+def test_normalize_qualifier(qualifier):
+    assert normalize_qualifier(qualifier) == qualifier
+
+
+def test_normalize_qualifier_rejects_unknown_value():
     with pytest.raises(ValueError):
         normalize_qualifier("~")
 
