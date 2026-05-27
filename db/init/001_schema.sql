@@ -198,6 +198,176 @@ CREATE INDEX idx_ic50_results_source_record_id
 CREATE INDEX idx_ic50_results_created_at
     ON ic50_results(created_at DESC);
 
+CREATE TABLE endpoints (
+    endpoint_id BIGSERIAL PRIMARY KEY,
+    endpoint_key TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    spec JSONB NOT NULL,
+    source_configs JSONB NOT NULL DEFAULT '{}'::JSONB,
+    spec_hash TEXT NOT NULL UNIQUE,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (BTRIM(endpoint_key) <> ''),
+    CHECK (BTRIM(display_name) <> ''),
+    CHECK (BTRIM(spec_hash) <> ''),
+    CHECK (jsonb_typeof(spec) = 'object'),
+    CHECK (jsonb_typeof(source_configs) = 'object')
+);
+
+CREATE INDEX idx_endpoints_active
+    ON endpoints(active);
+
+CREATE TABLE ingestion_runs (
+    ingestion_run_id BIGSERIAL PRIMARY KEY,
+    endpoint_id BIGINT NOT NULL REFERENCES endpoints(endpoint_id) ON DELETE RESTRICT,
+    source_name TEXT NOT NULL,
+    source_release TEXT,
+    query_config JSONB NOT NULL DEFAULT '{}'::JSONB,
+    query_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'partial')),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at TIMESTAMPTZ,
+    rows_seen INTEGER NOT NULL DEFAULT 0,
+    rows_inserted INTEGER NOT NULL DEFAULT 0,
+    rows_updated INTEGER NOT NULL DEFAULT 0,
+    rows_skipped INTEGER NOT NULL DEFAULT 0,
+    rows_failed INTEGER NOT NULL DEFAULT 0,
+    qc_summary JSONB NOT NULL DEFAULT '{}'::JSONB,
+    error_summary JSONB NOT NULL DEFAULT '{}'::JSONB,
+    CHECK (BTRIM(source_name) <> ''),
+    CHECK (BTRIM(query_hash) <> ''),
+    CHECK (jsonb_typeof(query_config) = 'object'),
+    CHECK (jsonb_typeof(qc_summary) = 'object'),
+    CHECK (jsonb_typeof(error_summary) = 'object'),
+    CHECK (rows_seen >= 0),
+    CHECK (rows_inserted >= 0),
+    CHECK (rows_updated >= 0),
+    CHECK (rows_skipped >= 0),
+    CHECK (rows_failed >= 0),
+    CHECK (finished_at IS NULL OR finished_at >= started_at)
+);
+
+CREATE INDEX idx_ingestion_runs_endpoint_source_started_at
+    ON ingestion_runs(endpoint_id, source_name, started_at DESC);
+
+CREATE INDEX idx_ingestion_runs_status
+    ON ingestion_runs(status);
+
+CREATE TABLE bioactivity_results (
+    result_id BIGSERIAL PRIMARY KEY,
+    endpoint_id BIGINT NOT NULL REFERENCES endpoints(endpoint_id) ON DELETE RESTRICT,
+    compound_id BIGINT NOT NULL REFERENCES compounds(compound_id) ON DELETE RESTRICT,
+    source_record_id BIGINT NOT NULL REFERENCES source_records(source_record_id) ON DELETE RESTRICT,
+    ingestion_run_id BIGINT REFERENCES ingestion_runs(ingestion_run_id) ON DELETE SET NULL,
+    result_key TEXT NOT NULL,
+    measurement_type TEXT NOT NULL,
+    value_kind TEXT NOT NULL CHECK (
+        value_kind IN ('concentration', 'percent', 'numeric', 'categorical', 'text')
+    ),
+    original_value NUMERIC,
+    original_unit TEXT,
+    original_relation TEXT,
+    standard_value NUMERIC,
+    standard_unit TEXT,
+    standard_relation TEXT,
+    p_value NUMERIC,
+    p_value_relation TEXT,
+    value_text TEXT,
+    assay_context JSONB NOT NULL DEFAULT '{}'::JSONB,
+    quality_flags JSONB NOT NULL DEFAULT '{}'::JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (endpoint_id, source_record_id, result_key),
+    CHECK (BTRIM(result_key) <> ''),
+    CHECK (BTRIM(measurement_type) <> ''),
+    CHECK (jsonb_typeof(assay_context) = 'object'),
+    CHECK (jsonb_typeof(quality_flags) = 'object')
+);
+
+CREATE INDEX idx_bioactivity_results_endpoint_id
+    ON bioactivity_results(endpoint_id);
+
+CREATE INDEX idx_bioactivity_results_compound_id
+    ON bioactivity_results(compound_id);
+
+CREATE INDEX idx_bioactivity_results_source_record_id
+    ON bioactivity_results(source_record_id);
+
+CREATE INDEX idx_bioactivity_results_ingestion_run_id
+    ON bioactivity_results(ingestion_run_id);
+
+CREATE INDEX idx_bioactivity_results_measurement_type
+    ON bioactivity_results(measurement_type);
+
+WITH herg_ic50_endpoint AS (
+    SELECT
+        'herg_ic50'::TEXT AS endpoint_key,
+        'hERG IC50'::TEXT AS display_name,
+        '{
+          "target": {
+            "preferred_name": "hERG",
+            "gene_symbol": "KCNH2",
+            "organism": "Homo sapiens",
+            "identifiers": {
+              "chembl_target_id": "CHEMBL240",
+              "ncbi_gene_id": "3757"
+            }
+          },
+          "measurement": {
+            "type": "IC50",
+            "value_kind": "concentration",
+            "canonical_unit": "uM",
+            "supports_p_value": true,
+            "p_value_name": "pIC50"
+          },
+          "normalization": {
+            "allowed_units": ["pM", "nM", "uM", "mM"],
+            "allowed_relations": ["=", "<", ">"]
+          },
+          "inclusion_criteria": {
+            "organism": "Homo sapiens",
+            "direct_target_only": true
+          }
+        }'::JSONB AS spec,
+        '{
+          "chembl": {
+            "target_chembl_id": "CHEMBL240",
+            "standard_type": "IC50",
+            "standard_relation__in": ["=", "<", ">"],
+            "data_validity_comment__isnull": true
+          },
+          "pubchem": {
+            "target_gene_symbol": "KCNH2",
+            "target_gene_id": "3757",
+            "activity_name_regex": "(?i)\\bIC50\\b"
+          }
+        }'::JSONB AS source_configs
+)
+INSERT INTO endpoints (
+    endpoint_key,
+    display_name,
+    spec,
+    source_configs,
+    spec_hash,
+    active
+)
+SELECT
+    endpoint_key,
+    display_name,
+    spec,
+    source_configs,
+    md5(spec::TEXT || '|' || source_configs::TEXT),
+    TRUE
+FROM herg_ic50_endpoint
+ON CONFLICT (endpoint_key)
+DO UPDATE SET
+    display_name = EXCLUDED.display_name,
+    spec = EXCLUDED.spec,
+    source_configs = EXCLUDED.source_configs,
+    spec_hash = EXCLUDED.spec_hash,
+    active = EXCLUDED.active;
+
 CREATE TRIGGER trg_set_compounds_updated_at
 BEFORE UPDATE
 ON compounds
@@ -225,6 +395,18 @@ EXECUTE FUNCTION set_updated_at();
 CREATE TRIGGER trg_set_ic50_results_updated_at
 BEFORE UPDATE
 ON ic50_results
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();
+
+CREATE TRIGGER trg_set_endpoints_updated_at
+BEFORE UPDATE
+ON endpoints
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();
+
+CREATE TRIGGER trg_set_bioactivity_results_updated_at
+BEFORE UPDATE
+ON bioactivity_results
 FOR EACH ROW
 EXECUTE FUNCTION set_updated_at();
 
