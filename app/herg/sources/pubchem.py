@@ -8,8 +8,11 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from typing import Dict, Iterable, List, Sequence
+from collections.abc import Mapping
+from typing import Any, Dict, Iterable, List, Pattern, Sequence
 
+from bioactivity.endpoints import EndpointConfig
+from bioactivity.models import MeasurementInput, measurement_from_ic50
 from ..config import DbConfig, HttpConfig, RunConfig
 from ..http import get_csv_rows, get_json
 from ..models import CompoundInput, Ic50Input, SourceRecordInput, StagedRecord
@@ -26,6 +29,7 @@ from ..pipeline import run_pipeline
 
 PUBCHEM_BASE_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 DEFAULT_CONCISE_PATH = "/assay/target/genesymbol/{gene_symbol}/concise/CSV"
+DEFAULT_CID_BATCH_SIZE = 150
 
 
 def _chunked(values: Sequence[int], size: int) -> Iterable[Sequence[int]]:
@@ -35,6 +39,47 @@ def _chunked(values: Sequence[int], size: int) -> Iterable[Sequence[int]]:
 
 def _log(message: str) -> None:
     print(message, flush=True)
+
+
+def _required_config_text(source_config: Mapping[str, Any], key: str) -> str:
+    value = clean_text(source_config.get(key))
+    if not value:
+        raise ValueError(f"PubChem source config requires '{key}'.")
+    return value
+
+
+def _compile_activity_name_regex(value: str) -> Pattern[str]:
+    try:
+        return re.compile(value)
+    except re.error as exc:
+        raise ValueError(f"Invalid PubChem activity_name_regex '{value}'.") from exc
+
+
+def _optional_positive_int(value: object, default: int) -> int:
+    if value is None:
+        return default
+    return parse_positive_int(value)
+
+
+def _normalize_pubchem_source_config(
+    source_config: Mapping[str, Any],
+    *,
+    cid_batch_size: int | None = None,
+) -> dict[str, object]:
+    if not isinstance(source_config, Mapping):
+        raise ValueError("PubChem source config must be a mapping.")
+
+    activity_name_regex = _required_config_text(source_config, "activity_name_regex")
+    _compile_activity_name_regex(activity_name_regex)
+
+    return {
+        "target_gene_symbol": _required_config_text(source_config, "target_gene_symbol"),
+        "target_gene_id": _required_config_text(source_config, "target_gene_id"),
+        "activity_name_regex": activity_name_regex,
+        "cid_batch_size": cid_batch_size
+        if cid_batch_size is not None
+        else _optional_positive_int(source_config.get("cid_batch_size"), DEFAULT_CID_BATCH_SIZE),
+    }
 
 
 class PubChemAdapter:
@@ -53,9 +98,39 @@ class PubChemAdapter:
         self.base_url = base_url.rstrip("/")
         self.target_gene_symbol = target_gene_symbol
         self.target_gene_id = target_gene_id
-        self.activity_name_pattern = re.compile(activity_name_regex)
+        self.activity_name_regex = activity_name_regex
+        self.activity_name_pattern = _compile_activity_name_regex(activity_name_regex)
         self.cid_batch_size = cid_batch_size
         self.enrich_batch_size = max(1, cid_batch_size)
+
+    @classmethod
+    def from_source_config(
+        cls,
+        endpoint: EndpointConfig,
+        source_config: Mapping[str, Any],
+        *,
+        http_config: HttpConfig,
+        base_url: str = PUBCHEM_BASE_URL,
+        cid_batch_size: int | None = None,
+    ) -> "PubChemAdapter":
+        config = _normalize_pubchem_source_config(source_config, cid_batch_size=cid_batch_size)
+        return cls(
+            http_config=http_config,
+            base_url=base_url,
+            target_gene_symbol=str(config["target_gene_symbol"]),
+            target_gene_id=str(config["target_gene_id"]),
+            activity_name_regex=str(config["activity_name_regex"]),
+            cid_batch_size=int(config["cid_batch_size"]),
+        )
+
+    @property
+    def effective_config(self) -> dict[str, object]:
+        return {
+            "target_gene_symbol": self.target_gene_symbol,
+            "target_gene_id": self.target_gene_id,
+            "activity_name_regex": self.activity_name_regex,
+            "cid_batch_size": self.cid_batch_size,
+        }
 
     def iter_raw_rows(self) -> Iterable[dict]:
         concise_url = self.base_url + DEFAULT_CONCISE_PATH.format(gene_symbol=self.target_gene_symbol)
@@ -191,6 +266,27 @@ class PubChemAdapter:
             source_record=source_record,
             measurement=measurement,
         )
+
+
+def measurement_input_from_pubchem_record(record: StagedRecord) -> MeasurementInput:
+    concise_row = record.source_record.raw_payload.get("concise_row") or {}
+    assay_context = {
+        "aid": clean_text(concise_row.get("AID")),
+        "sid": clean_text(concise_row.get("SID")),
+        "cid": clean_text(concise_row.get("CID")),
+        "activity_name": clean_text(concise_row.get("Activity Name")),
+        "activity_outcome": clean_text(concise_row.get("Activity Outcome")),
+        "assay_name": clean_text(concise_row.get("Assay Name")),
+    }
+    assay_context = {key: value for key, value in assay_context.items() if value}
+    return measurement_from_ic50(
+        result_key=record.external_key,
+        ic50_value=record.measurement.ic50_value,
+        ic50_unit=record.measurement.ic50_unit,
+        qualifier=record.measurement.qualifier,
+        assay_context=assay_context,
+        quality_flags={"source": PubChemAdapter.source_name},
+    )
 
 
 def _build_db_config(args: argparse.Namespace) -> DbConfig:
