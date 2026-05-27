@@ -1,4 +1,7 @@
 import importlib
+import re
+
+import pandas as pd
 
 from bioactivity.preview import PreviewExample, PreviewResult
 
@@ -47,3 +50,13 @@ def test_preview_result_display_data_handles_fake_preview_result():
     assert display["accepted"].iloc[0]["external_key"] == "activity:1"
     assert display["skipped"].iloc[0]["reason"] == "Missing molecule metadata."
     assert display["warnings"] == ["fixture warning"]
+
+
+def test_histogram_chart_data_formats_x_axis_labels_to_two_decimals():
+    module = importlib.import_module("app")
+    histogram_counts = module.build_histogram_counts(pd.Series([1.0, 1.5, 2.0]), bins=2)
+
+    chart_data = module.histogram_chart_data(histogram_counts)
+
+    assert list(chart_data.columns) == ["count"]
+    assert all(re.fullmatch(r"-?\d+\.\d{2}", label) for label in chart_data.index)

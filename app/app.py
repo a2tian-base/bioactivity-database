@@ -312,6 +312,12 @@ def build_histogram_counts(series: pd.Series, bins: int) -> pd.DataFrame:
     )
 
 
+def histogram_chart_data(histogram_counts: pd.DataFrame) -> pd.DataFrame:
+    chart_data = histogram_counts.copy()
+    chart_data["bin_start_label"] = chart_data["bin_start"].map(lambda value: f"{value:.2f}")
+    return chart_data.set_index("bin_start_label")[["count"]].rename_axis("bin_start")
+
+
 def render_import_summary(entity: str, summary: dict[str, Any]) -> None:
     st.info(
         f"{entity}: imported {summary['imported']} of {summary['total']} rows "
@@ -960,14 +966,14 @@ def render_dashboard_tab(selected_endpoint: EndpointConfig) -> None:
             if standard_hist.empty:
                 st.info("No standardized numeric values.")
             else:
-                st.bar_chart(standard_hist.set_index("bin_start")[["count"]])
+                st.bar_chart(histogram_chart_data(standard_hist))
         with value_col2:
             st.caption("p-value histogram")
             p_value_hist = build_histogram_counts(concentration_df["p_value_numeric"], bins=30)
             if p_value_hist.empty:
                 st.info("No p-values.")
             else:
-                st.bar_chart(p_value_hist.set_index("bin_start")[["count"]])
+                st.bar_chart(histogram_chart_data(p_value_hist))
 
     st.markdown("### Trend and Top Compounds")
     trend_col1, trend_col2 = st.columns(2)
