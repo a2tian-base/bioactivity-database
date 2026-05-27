@@ -13,11 +13,12 @@ from herg.config import DbConfig, HttpConfig
 from herg.db import get_conn
 from herg.models import StagedRecord
 from herg.normalize import clean_text
-from herg.sources.chembl import ChemblAdapter, measurement_input_from_chembl_record
-from herg.sources.pubchem import PubChemAdapter, measurement_input_from_pubchem_record
+from herg.sources.chembl import measurement_input_from_chembl_record
+from herg.sources.pubchem import measurement_input_from_pubchem_record
 
 from .endpoints import EndpointConfig, get_source_config, load_endpoint
 from .models import MeasurementInput, measurement_from_ic50
+from .source_adapters import build_source_adapter
 
 
 class PreviewError(ValueError):
@@ -70,11 +71,21 @@ class PreviewResult:
 
 
 def _chembl_factory(endpoint: EndpointConfig, source_config: dict[str, Any], http_config: HttpConfig) -> PreviewAdapter:
-    return ChemblAdapter.from_source_config(endpoint, source_config, http_config=http_config)
+    return build_source_adapter(
+        endpoint=endpoint,
+        source_name="chembl",
+        source_config=source_config,
+        http_config=http_config,
+    )
 
 
 def _pubchem_factory(endpoint: EndpointConfig, source_config: dict[str, Any], http_config: HttpConfig) -> PreviewAdapter:
-    return PubChemAdapter.from_source_config(endpoint, source_config, http_config=http_config)
+    return build_source_adapter(
+        endpoint=endpoint,
+        source_name="pubchem",
+        source_config=source_config,
+        http_config=http_config,
+    )
 
 
 DEFAULT_ADAPTER_FACTORIES: dict[str, AdapterFactory] = {
