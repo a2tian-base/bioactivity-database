@@ -1,4 +1,5 @@
 import importlib
+import re
 from decimal import Decimal
 
 import pandas as pd
@@ -337,3 +338,13 @@ def test_load_results_for_endpoint_merges_legacy_herg_rows_after_partial_migrati
     assert data_source == "bioactivity_results + legacy ic50_results"
     assert list(results_df["source_record_id"]) == [31, 30]
     assert set(results_df["compound"]) == {"new-row", "legacy-row"}
+
+
+def test_histogram_chart_data_formats_x_axis_labels_to_two_decimals():
+    module = importlib.import_module("app")
+    histogram_counts = module.build_histogram_counts(pd.Series([1.0, 1.5, 2.0]), bins=2)
+
+    chart_data = module.histogram_chart_data(histogram_counts)
+
+    assert list(chart_data.columns) == ["count"]
+    assert all(re.fullmatch(r"-?\d+\.\d{2}", label) for label in chart_data.index)
