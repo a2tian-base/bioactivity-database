@@ -28,6 +28,26 @@ Notes:
 
 Run scripts inside the `frontend` container so they use the same dependencies and network as the app.
 
+### UI ingestion
+
+The Streamlit `Ingest` tab uses the currently selected endpoint and lists sources configured in `endpoints.source_configs`.
+
+Recommended workflow:
+
+```text
+1. Select an endpoint.
+2. Open Ingest.
+3. Select chembl or pubchem.
+4. Preview source rows.
+5. Run dry-run ingestion with a max-record limit.
+6. Disable dry-run only after reviewing the preview and dry-run counters.
+7. Confirm write ingestion explicitly before running.
+```
+
+Dry-run is enabled by default, max records defaults to 100, and write ingestion requires the confirmation checkbox. Completed write ingestion records can be inspected in `ingestion_runs`, `bioactivity_results`, and the endpoint-aware Browse Results tab.
+
+### CLI ingestion
+
 Generic endpoint ingestion is the preferred path. Endpoint-specific settings come from the `endpoints.source_configs` JSON, and CLI source flags act as explicit overrides.
 
 ChEMBL endpoint ingestion:
