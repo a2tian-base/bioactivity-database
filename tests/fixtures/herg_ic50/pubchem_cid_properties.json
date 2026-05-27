@@ -1,0 +1,13 @@
+{
+  "PropertyTable": {
+    "Properties": [
+      {
+        "CID": 3,
+        "Title": "PubChemTest",
+        "CanonicalSMILES": "CCO",
+        "ConnectivitySMILES": "CCO",
+        "InChIKey": "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
+      }
+    ]
+  }
+}

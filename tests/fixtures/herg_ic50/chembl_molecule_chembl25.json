@@ -1,0 +1,17 @@
+{
+  "molecule_chembl_id": "CHEMBL25",
+  "pref_name": "TestMol",
+  "molecule_structures": {
+    "canonical_smiles": "CCO",
+    "standard_inchi": "InChI=1S/C2H6O/c1-2-3/h3H,2H2,1H3",
+    "standard_inchi_key": "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
+  },
+  "molecule_synonyms": [
+    {
+      "molecule_synonym": "AliasOne"
+    },
+    {
+      "molecule_synonym": "AliasTwo"
+    }
+  ]
+}
