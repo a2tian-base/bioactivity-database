@@ -32,6 +32,12 @@ from herg.normalize import (
 )
 from herg.read_db import fetch_compounds, resolve_compound_id
 
+DEFAULT_INGESTION_PREVIEW_LIMIT = 20
+DEFAULT_INGESTION_MAX_RECORDS = 100
+DEFAULT_INGESTION_REQUEST_TIMEOUT_SECONDS = 45
+DEFAULT_INGESTION_HTTP_RETRIES = 4
+DEFAULT_INGESTION_COMMIT_EVERY = 500
+
 
 def build_compound_label(compound: dict[str, Any]) -> str:
     compound_id = compound.get("compound_id")
@@ -719,35 +725,42 @@ def render_ingest_tab(selected_endpoint: EndpointConfig) -> None:
     key_prefix = f"ingest_{selected_endpoint.endpoint_key}"
     selected_source = st.selectbox("Source", options=source_names, key=f"{key_prefix}_source")
 
-    config_col1, config_col2 = st.columns(2)
-    with config_col1:
+    with st.expander("Advanced configuration"):
+        preview_limit = st.number_input(
+            "Preview limit",
+            min_value=1,
+            max_value=200,
+            value=DEFAULT_INGESTION_PREVIEW_LIMIT,
+            step=1,
+            key=f"{key_prefix}_preview_limit",
+        )
         request_timeout_seconds = st.number_input(
             "Request timeout seconds",
             min_value=1,
             max_value=300,
-            value=45,
+            value=DEFAULT_INGESTION_REQUEST_TIMEOUT_SECONDS,
             step=1,
             key=f"{key_prefix}_timeout",
         )
-    with config_col2:
         http_retries = st.number_input(
             "HTTP retries",
             min_value=0,
             max_value=10,
-            value=4,
+            value=DEFAULT_INGESTION_HTTP_RETRIES,
             step=1,
             key=f"{key_prefix}_retries",
         )
+        commit_every = st.number_input(
+            "Commit every",
+            min_value=1,
+            max_value=10000,
+            value=DEFAULT_INGESTION_COMMIT_EVERY,
+            step=50,
+            key=f"{key_prefix}_commit_every",
+        )
+        fail_fast = st.checkbox("Fail fast", value=False, key=f"{key_prefix}_fail_fast")
 
-    st.markdown("### Preview Source Rows")
-    preview_limit = st.number_input(
-        "Preview limit",
-        min_value=1,
-        max_value=200,
-        value=20,
-        step=1,
-        key=f"{key_prefix}_preview_limit",
-    )
+    st.markdown("### Preview")
     if st.button("Preview source rows", key=f"{key_prefix}_preview_button"):
         try:
             with st.spinner("Previewing source rows..."):
@@ -768,28 +781,14 @@ def render_ingest_tab(selected_endpoint: EndpointConfig) -> None:
 
     st.markdown("### Run Ingestion")
     dry_run = st.checkbox("Dry run", value=True, key=f"{key_prefix}_dry_run")
-    limit_records = st.checkbox("Limit records", value=True, key=f"{key_prefix}_limit_records")
-    ingestion_col1, ingestion_col2 = st.columns(2)
-    with ingestion_col1:
-        max_records = st.number_input(
-            "Max records",
-            min_value=1,
-            max_value=250000,
-            value=100,
-            step=10,
-            disabled=not limit_records,
-            key=f"{key_prefix}_max_records",
-        )
-    with ingestion_col2:
-        commit_every = st.number_input(
-            "Commit every",
-            min_value=1,
-            max_value=10000,
-            value=500,
-            step=50,
-            key=f"{key_prefix}_commit_every",
-        )
-    fail_fast = st.checkbox("Fail fast", value=False, key=f"{key_prefix}_fail_fast")
+    max_records = st.number_input(
+        "Max records",
+        min_value=1,
+        max_value=250000,
+        value=DEFAULT_INGESTION_MAX_RECORDS,
+        step=10,
+        key=f"{key_prefix}_max_records",
+    )
 
     confirmed_write = True
     if not dry_run:
@@ -810,7 +809,7 @@ def render_ingest_tab(selected_endpoint: EndpointConfig) -> None:
             endpoint_key=selected_endpoint.endpoint_key,
             source_name=selected_source,
             dry_run=bool(dry_run),
-            max_records=int(max_records) if limit_records else None,
+            max_records=int(max_records),
             commit_every=int(commit_every),
             fail_fast=bool(fail_fast),
             request_timeout_seconds=int(request_timeout_seconds),
