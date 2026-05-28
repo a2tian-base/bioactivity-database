@@ -10,10 +10,11 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import Any, Dict, Iterable, List, Optional
 
-from bioactivity.endpoints import EndpointConfig
+from bioactivity.endpoints import EndpointConfig, get_source_config, load_endpoint
 from bioactivity.models import MeasurementInput, measurement_from_ic50
 
 from ..config import DbConfig, HttpConfig, RunConfig
+from ..db import get_conn
 from ..http import get_json
 from ..models import CompoundInput, Ic50Input, SourceRecordInput, StagedRecord
 from ..normalize import (
@@ -311,16 +312,30 @@ class ChemblAdapter:
                 names.append(str(value))
         return dedupe_casefolded(names)[:50]
 
+    def measurement_input_from_record(
+        self,
+        record: StagedRecord,
+        ic50_result: Mapping[str, Any] | None = None,
+    ) -> MeasurementInput:
+        return measurement_input_from_chembl_record(record, ic50_result)
 
-def measurement_input_from_chembl_record(record: StagedRecord) -> MeasurementInput:
+
+def measurement_input_from_chembl_record(
+    record: StagedRecord,
+    ic50_result: Mapping[str, Any] | None = None,
+) -> MeasurementInput:
     activity = record.source_record.raw_payload.get("activity") or {}
     assay_chembl_id = clean_text(activity.get("assay_chembl_id"))
     assay_context = {"assay_chembl_id": assay_chembl_id} if assay_chembl_id else {}
+    ic50_result = ic50_result or {}
     return measurement_from_ic50(
         result_key=record.external_key,
         ic50_value=record.measurement.ic50_value,
         ic50_unit=record.measurement.ic50_unit,
         qualifier=record.measurement.qualifier,
+        ic50_um=ic50_result.get("ic50_um"),
+        pic50=ic50_result.get("pic50"),
+        pic50_qualifier=ic50_result.get("pic50_qualifier"),
         assay_context=assay_context,
         quality_flags={"source": ChemblAdapter.source_name},
     )
@@ -339,12 +354,13 @@ def _build_db_config(args: argparse.Namespace) -> DbConfig:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ingest hERG IC50 data from ChEMBL.")
+    parser.add_argument("--endpoint-key", default="herg_ic50")
     parser.add_argument("--chembl-base-url", default=CHEMBL_BASE_URL)
-    parser.add_argument("--target-chembl-id", default="CHEMBL240")
-    parser.add_argument("--standard-type", default="IC50")
-    parser.add_argument("--relations", default="=,<,>")
-    parser.add_argument("--activity-page-size", type=int, default=1000)
-    parser.add_argument("--molecule-batch-size", type=int, default=150)
+    parser.add_argument("--target-chembl-id", default=None)
+    parser.add_argument("--standard-type", default=None)
+    parser.add_argument("--relations", default=None)
+    parser.add_argument("--activity-page-size", type=int, default=None)
+    parser.add_argument("--molecule-batch-size", type=int, default=None)
 
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-records", type=int, default=None)
@@ -363,6 +379,17 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _chembl_source_config_from_args(endpoint: EndpointConfig, args: argparse.Namespace) -> dict[str, object]:
+    source_config = get_source_config(endpoint, ChemblAdapter.source_name)
+    if args.target_chembl_id:
+        source_config["target_chembl_id"] = args.target_chembl_id
+    if args.standard_type:
+        source_config["standard_type"] = args.standard_type
+    if args.relations:
+        source_config["standard_relation__in"] = args.relations
+    return source_config
+
+
 def main() -> int:
     args = _parse_args()
     http_config = HttpConfig(
@@ -379,17 +406,19 @@ def main() -> int:
     )
     db_config = _build_db_config(args)
 
-    adapter = ChemblAdapter(
+    with get_conn(db_config=db_config) as conn:
+        endpoint = load_endpoint(conn, args.endpoint_key)
+
+    adapter = ChemblAdapter.from_source_config(
+        endpoint,
+        _chembl_source_config_from_args(endpoint, args),
         http_config=http_config,
         base_url=args.chembl_base_url,
-        target_chembl_id=args.target_chembl_id,
-        standard_type=args.standard_type,
-        relations=args.relations,
         activity_page_size=args.activity_page_size,
         molecule_batch_size=args.molecule_batch_size,
     )
 
-    stats = run_pipeline(adapter, db_config, run_config)
+    stats = run_pipeline(adapter, db_config, run_config, endpoint_key=endpoint.endpoint_key)
 
     _log("")
     _log("Ingestion summary")

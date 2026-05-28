@@ -201,6 +201,9 @@ def ensure_measurement_ingest_schema(cur: psycopg.Cursor) -> None:
             "compound_identifiers",
             "compound_names",
             "source_records",
+            "endpoints",
+            "ingestion_runs",
+            "bioactivity_results",
             "ic50_results",
         ],
     )
@@ -210,6 +213,7 @@ def ensure_measurement_ingest_schema(cur: psycopg.Cursor) -> None:
             "register_compound_v2",
             "upsert_source_record",
             "upsert_ic50_result",
+            "upsert_bioactivity_result",
         ],
     )
     if not missing_tables and not missing_functions:

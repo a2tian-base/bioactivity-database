@@ -11,9 +11,10 @@ import sys
 from collections.abc import Mapping
 from typing import Any, Dict, Iterable, List, Pattern, Sequence
 
-from bioactivity.endpoints import EndpointConfig
+from bioactivity.endpoints import EndpointConfig, get_source_config, load_endpoint
 from bioactivity.models import MeasurementInput, measurement_from_ic50
 from ..config import DbConfig, HttpConfig, RunConfig
+from ..db import get_conn
 from ..http import get_csv_rows, get_json
 from ..models import CompoundInput, Ic50Input, SourceRecordInput, StagedRecord
 from ..normalize import (
@@ -267,8 +268,18 @@ class PubChemAdapter:
             measurement=measurement,
         )
 
+    def measurement_input_from_record(
+        self,
+        record: StagedRecord,
+        ic50_result: Mapping[str, Any] | None = None,
+    ) -> MeasurementInput:
+        return measurement_input_from_pubchem_record(record, ic50_result)
 
-def measurement_input_from_pubchem_record(record: StagedRecord) -> MeasurementInput:
+
+def measurement_input_from_pubchem_record(
+    record: StagedRecord,
+    ic50_result: Mapping[str, Any] | None = None,
+) -> MeasurementInput:
     concise_row = record.source_record.raw_payload.get("concise_row") or {}
     assay_context = {
         "aid": clean_text(concise_row.get("AID")),
@@ -279,11 +290,15 @@ def measurement_input_from_pubchem_record(record: StagedRecord) -> MeasurementIn
         "assay_name": clean_text(concise_row.get("Assay Name")),
     }
     assay_context = {key: value for key, value in assay_context.items() if value}
+    ic50_result = ic50_result or {}
     return measurement_from_ic50(
         result_key=record.external_key,
         ic50_value=record.measurement.ic50_value,
         ic50_unit=record.measurement.ic50_unit,
         qualifier=record.measurement.qualifier,
+        ic50_um=ic50_result.get("ic50_um"),
+        pic50=ic50_result.get("pic50"),
+        pic50_qualifier=ic50_result.get("pic50_qualifier"),
         assay_context=assay_context,
         quality_flags={"source": PubChemAdapter.source_name},
     )
@@ -302,11 +317,12 @@ def _build_db_config(args: argparse.Namespace) -> DbConfig:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ingest hERG IC50 data from PubChem.")
+    parser.add_argument("--endpoint-key", default="herg_ic50")
     parser.add_argument("--pubchem-base-url", default=PUBCHEM_BASE_URL)
-    parser.add_argument("--target-gene-symbol", default="KCNH2")
-    parser.add_argument("--target-gene-id", default="3757")
-    parser.add_argument("--activity-name-regex", default=r"(?i)\bic50\b")
-    parser.add_argument("--cid-batch-size", type=int, default=150)
+    parser.add_argument("--target-gene-symbol", default=None)
+    parser.add_argument("--target-gene-id", default=None)
+    parser.add_argument("--activity-name-regex", default=None)
+    parser.add_argument("--cid-batch-size", type=int, default=None)
 
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-records", type=int, default=None)
@@ -325,6 +341,17 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _pubchem_source_config_from_args(endpoint: EndpointConfig, args: argparse.Namespace) -> dict[str, object]:
+    source_config = get_source_config(endpoint, PubChemAdapter.source_name)
+    if args.target_gene_symbol:
+        source_config["target_gene_symbol"] = args.target_gene_symbol
+    if args.target_gene_id:
+        source_config["target_gene_id"] = args.target_gene_id
+    if args.activity_name_regex:
+        source_config["activity_name_regex"] = args.activity_name_regex
+    return source_config
+
+
 def main() -> int:
     args = _parse_args()
     http_config = HttpConfig(
@@ -341,16 +368,18 @@ def main() -> int:
     )
     db_config = _build_db_config(args)
 
-    adapter = PubChemAdapter(
+    with get_conn(db_config=db_config) as conn:
+        endpoint = load_endpoint(conn, args.endpoint_key)
+
+    adapter = PubChemAdapter.from_source_config(
+        endpoint,
+        _pubchem_source_config_from_args(endpoint, args),
         http_config=http_config,
         base_url=args.pubchem_base_url,
-        target_gene_symbol=args.target_gene_symbol,
-        target_gene_id=args.target_gene_id,
-        activity_name_regex=args.activity_name_regex,
         cid_batch_size=args.cid_batch_size,
     )
 
-    stats = run_pipeline(adapter, db_config, run_config)
+    stats = run_pipeline(adapter, db_config, run_config, endpoint_key=endpoint.endpoint_key)
 
     _log("")
     _log("Ingestion summary")
