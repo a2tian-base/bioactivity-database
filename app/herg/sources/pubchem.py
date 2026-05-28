@@ -322,7 +322,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--target-gene-symbol", default=None)
     parser.add_argument("--target-gene-id", default=None)
     parser.add_argument("--activity-name-regex", default=None)
-    parser.add_argument("--cid-batch-size", type=int, default=150)
+    parser.add_argument("--cid-batch-size", type=int, default=None)
 
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-records", type=int, default=None)

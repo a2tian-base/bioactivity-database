@@ -6,7 +6,7 @@ import pytest
 
 from bioactivity.endpoints import EndpointConfig, get_source_config
 from herg.config import HttpConfig
-from herg.sources.pubchem import PubChemAdapter, measurement_input_from_pubchem_record
+from herg.sources.pubchem import PubChemAdapter, _parse_args, measurement_input_from_pubchem_record
 
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "herg_ic50"
@@ -86,6 +86,14 @@ def test_pubchem_adapter_from_source_config_matches_explicit_herg_config(monkeyp
     )
 
     assert configured_adapter.effective_config == explicit_adapter.effective_config
+
+
+def test_pubchem_cli_batch_option_defaults_to_endpoint_config(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["pubchem.py"])
+
+    args = _parse_args()
+
+    assert args.cid_batch_size is None
 
 
 def test_pubchem_adapter_from_source_config_rejects_missing_target_gene_symbol():

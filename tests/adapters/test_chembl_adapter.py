@@ -6,7 +6,7 @@ import pytest
 
 from bioactivity.endpoints import EndpointConfig, get_source_config
 from herg.config import HttpConfig
-from herg.sources.chembl import ChemblAdapter, measurement_input_from_chembl_record
+from herg.sources.chembl import ChemblAdapter, _parse_args, measurement_input_from_chembl_record
 
 
 FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "herg_ic50"
@@ -95,6 +95,15 @@ def test_chembl_adapter_from_source_config_matches_explicit_herg_config(monkeypa
     )
 
     assert configured_adapter.effective_config == explicit_adapter.effective_config
+
+
+def test_chembl_cli_batch_options_default_to_endpoint_config(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["chembl.py"])
+
+    args = _parse_args()
+
+    assert args.activity_page_size is None
+    assert args.molecule_batch_size is None
 
 
 def test_chembl_adapter_from_source_config_rejects_missing_target_chembl_id():

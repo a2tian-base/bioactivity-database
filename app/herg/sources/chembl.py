@@ -359,8 +359,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--target-chembl-id", default=None)
     parser.add_argument("--standard-type", default=None)
     parser.add_argument("--relations", default=None)
-    parser.add_argument("--activity-page-size", type=int, default=1000)
-    parser.add_argument("--molecule-batch-size", type=int, default=150)
+    parser.add_argument("--activity-page-size", type=int, default=None)
+    parser.add_argument("--molecule-batch-size", type=int, default=None)
 
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--max-records", type=int, default=None)

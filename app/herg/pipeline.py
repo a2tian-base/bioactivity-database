@@ -99,11 +99,15 @@ def _run_counters(stats: IngestionStats) -> dict[str, int]:
     }
 
 
+def _successful_rows(stats: IngestionStats) -> int:
+    return stats.stored + stats.updated
+
+
 def _run_status(stats: IngestionStats, *, uncaught_error: bool = False) -> str:
     if uncaught_error:
-        return "partial" if stats.stored > 0 else "failed"
+        return "partial" if _successful_rows(stats) > 0 else "failed"
     if stats.failed > 0:
-        return "partial" if stats.stored > 0 else "failed"
+        return "partial" if _successful_rows(stats) > 0 else "failed"
     if stats.skipped_invalid > 0:
         return "partial"
     return "succeeded"
@@ -137,6 +141,29 @@ def _measurement_input_for_adapter(
     return _measurement_input_from_staged_record(staged, ic50_result, adapter.source_name)
 
 
+def _bioactivity_result_exists(
+    cur,
+    *,
+    endpoint_id: int,
+    source_record_id: int,
+    result_key: str,
+) -> bool:
+    cur.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM bioactivity_results
+            WHERE endpoint_id = %s::bigint
+              AND source_record_id = %s::bigint
+              AND result_key = %s::text
+        )
+        """,
+        (endpoint_id, source_record_id, clean_text(result_key)),
+    )
+    row = cur.fetchone()
+    return bool(row and row[0])
+
+
 def run_pipeline(
     adapter: SourceAdapter,
     db_config: DbConfig,
@@ -154,9 +181,10 @@ def run_pipeline(
     buffer: list[dict] = []
     endpoint_id: int | None = None
     ingestion_run_id: int | None = None
+    uncaught_error_counted = False
 
     def process_rows(rows: list[dict], cur) -> None:
-        nonlocal processed_since_commit
+        nonlocal processed_since_commit, uncaught_error_counted
         enriched_rows = adapter.enrich_batch(rows)
         if len(enriched_rows) != len(rows):
             stats.warnings += 1
@@ -169,12 +197,14 @@ def run_pipeline(
                 stats.skipped_invalid += 1
                 log_jsonl(error_logger, adapter.source_name, raw_external_key, str(exc), row)
                 if run_config.fail_fast:
+                    uncaught_error_counted = True
                     raise
                 continue
             except Exception as exc:
                 stats.failed += 1
                 log_jsonl(error_logger, adapter.source_name, raw_external_key, str(exc), row)
                 if run_config.fail_fast:
+                    uncaught_error_counted = True
                     raise
                 continue
 
@@ -187,17 +217,28 @@ def run_pipeline(
                 compound_id = upsert_compound(cur, staged.compound)
                 source_record_id = upsert_source_record(cur, staged.source_record)
                 ic50_result = upsert_ic50_result(cur, compound_id, source_record_id, staged.measurement)
+                row_was_update = False
                 if endpoint_id is not None:
+                    measurement = _measurement_input_for_adapter(adapter, staged, ic50_result)
+                    row_was_update = _bioactivity_result_exists(
+                        cur,
+                        endpoint_id=endpoint_id,
+                        source_record_id=source_record_id,
+                        result_key=measurement.result_key,
+                    )
                     upsert_bioactivity_result(
                         cur,
                         endpoint_id=endpoint_id,
                         compound_id=compound_id,
                         source_record_id=source_record_id,
                         ingestion_run_id=ingestion_run_id,
-                        measurement=_measurement_input_for_adapter(adapter, staged, ic50_result),
+                        measurement=measurement,
                     )
                 cur.execute("RELEASE SAVEPOINT ingest_row")
-                stats.stored += 1
+                if row_was_update:
+                    stats.updated += 1
+                else:
+                    stats.stored += 1
                 processed_since_commit += 1
             except Exception as exc:
                 cur.execute("ROLLBACK TO SAVEPOINT ingest_row")
@@ -205,6 +246,7 @@ def run_pipeline(
                 stats.failed += 1
                 log_jsonl(error_logger, adapter.source_name, staged.external_key, str(exc), asdict(staged))
                 if run_config.fail_fast:
+                    uncaught_error_counted = True
                     raise
 
             if processed_since_commit >= commit_every:
@@ -262,7 +304,8 @@ def run_pipeline(
                         conn.commit()
                 except Exception:
                     if not run_config.dry_run and ingestion_run_id is not None:
-                        stats.failed += 1
+                        if not uncaught_error_counted:
+                            stats.failed += 1
                         finish_ingestion_run(
                             cur,
                             ingestion_run_id=ingestion_run_id,

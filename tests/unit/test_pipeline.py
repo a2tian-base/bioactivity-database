@@ -2,6 +2,8 @@ import json
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 from bioactivity.models import measurement_from_ic50
 from herg.config import DbConfig, RunConfig
 from herg.models import CompoundInput, Ic50Input, SourceRecordInput, StagedRecord
@@ -21,6 +23,9 @@ class _DummyCursor:
 
     def execute(self, *_args, **_kwargs):
         return None
+
+    def fetchone(self):
+        return (False,)
 
 
 class _DummyConnection:
@@ -181,3 +186,187 @@ def test_pipeline_non_dry_run_uses_adapter_measurement_mapper(monkeypatch):
     assert measurement.standard_unit == "uM"
     assert measurement.p_value == Decimal("7.000000")
     assert measurement.p_value_relation == "="
+
+
+def test_pipeline_counts_existing_generic_result_as_updated(monkeypatch):
+    finished = {}
+    existence_checks = []
+
+    monkeypatch.setattr("herg.pipeline.get_conn", lambda **kwargs: _DummyConnection())
+    monkeypatch.setattr("herg.pipeline.ensure_measurement_ingest_schema", lambda cur: None)
+    monkeypatch.setattr("herg.pipeline.load_endpoint", lambda cur, endpoint_key: SimpleNamespace(endpoint_id=99))
+    monkeypatch.setattr("herg.pipeline.start_ingestion_run", lambda cur, **kwargs: 77)
+    monkeypatch.setattr("herg.pipeline.finish_ingestion_run", lambda cur, **kwargs: finished.update(kwargs))
+    monkeypatch.setattr("herg.pipeline.upsert_compound", lambda cur, compound: 10)
+    monkeypatch.setattr("herg.pipeline.upsert_source_record", lambda cur, source_record: 20)
+    monkeypatch.setattr(
+        "herg.pipeline.upsert_ic50_result",
+        lambda cur, compound_id, source_record_id, measurement: {
+            "result_id": 30,
+            "ic50_um": "0.100000",
+            "pic50": "7.000000",
+            "pic50_qualifier": "=",
+        },
+    )
+
+    def fake_exists(cur, **kwargs):
+        existence_checks.append(kwargs)
+        return True
+
+    monkeypatch.setattr("herg.pipeline._bioactivity_result_exists", fake_exists)
+    monkeypatch.setattr("herg.pipeline.upsert_bioactivity_result", lambda cur, **kwargs: 40)
+
+    class Adapter:
+        source_name = "fixture_existing_result"
+        effective_config = {"fixture": "existing_result"}
+
+        def iter_raw_rows(self):
+            yield {"external_key": "row:existing_result"}
+
+        def enrich_batch(self, rows):
+            return rows
+
+        def map_row(self, row):
+            return StagedRecord(
+                external_key=row["external_key"],
+                compound=CompoundInput(
+                    identifiers=build_identifier_inputs({"fixture_id": "existing-result-1"}, "fixture_id"),
+                ),
+                source_record=SourceRecordInput(
+                    source_name=self.source_name,
+                    source_record_key=row["external_key"],
+                    record_type="fixture",
+                ),
+                measurement=Ic50Input(
+                    ic50_value=100.0,
+                    ic50_unit="nM",
+                    qualifier="=",
+                    endpoint="IC50",
+                ),
+            )
+
+    stats = run_pipeline(
+        Adapter(),
+        DbConfig(host="localhost", port=5432, dbname="herg", user="herg_user", password="change_me"),
+        RunConfig(dry_run=False),
+    )
+
+    assert stats.stored == 0
+    assert stats.updated == 1
+    assert finished["status"] == "succeeded"
+    assert finished["counters"]["rows_inserted"] == 0
+    assert finished["counters"]["rows_updated"] == 1
+    assert existence_checks == [
+        {
+            "endpoint_id": 99,
+            "source_record_id": 20,
+            "result_key": "row:existing_result",
+        }
+    ]
+
+
+def test_pipeline_fail_fast_does_not_double_count_write_failure(monkeypatch):
+    finished = {}
+
+    monkeypatch.setattr("herg.pipeline.get_conn", lambda **kwargs: _DummyConnection())
+    monkeypatch.setattr("herg.pipeline.ensure_measurement_ingest_schema", lambda cur: None)
+    monkeypatch.setattr("herg.pipeline.load_endpoint", lambda cur, endpoint_key: SimpleNamespace(endpoint_id=99))
+    monkeypatch.setattr("herg.pipeline.start_ingestion_run", lambda cur, **kwargs: 77)
+    monkeypatch.setattr("herg.pipeline.finish_ingestion_run", lambda cur, **kwargs: finished.update(kwargs))
+    monkeypatch.setattr("herg.pipeline.upsert_compound", lambda cur, compound: 10)
+    monkeypatch.setattr("herg.pipeline.upsert_source_record", lambda cur, source_record: 20)
+
+    def raise_write_error(cur, compound_id, source_record_id, measurement):
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr("herg.pipeline.upsert_ic50_result", raise_write_error)
+
+    class Adapter:
+        source_name = "fixture_write_failure"
+        effective_config = {"fixture": "write_failure"}
+
+        def iter_raw_rows(self):
+            yield {"external_key": "row:write_failure"}
+
+        def enrich_batch(self, rows):
+            return rows
+
+        def map_row(self, row):
+            return StagedRecord(
+                external_key=row["external_key"],
+                compound=CompoundInput(
+                    identifiers=build_identifier_inputs({"fixture_id": "write-failure-1"}, "fixture_id"),
+                ),
+                source_record=SourceRecordInput(
+                    source_name=self.source_name,
+                    source_record_key=row["external_key"],
+                    record_type="fixture",
+                ),
+                measurement=Ic50Input(
+                    ic50_value=100.0,
+                    ic50_unit="nM",
+                    qualifier="=",
+                    endpoint="IC50",
+                ),
+            )
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        run_pipeline(
+            Adapter(),
+            DbConfig(host="localhost", port=5432, dbname="herg", user="herg_user", password="change_me"),
+            RunConfig(dry_run=False, fail_fast=True),
+        )
+
+    assert finished["status"] == "failed"
+    assert finished["counters"]["rows_seen"] == 1
+    assert finished["counters"]["rows_failed"] == 1
+    assert finished["counters"]["rows_skipped"] == 0
+
+
+def test_pipeline_fail_fast_does_not_mark_validation_skip_as_failed(monkeypatch):
+    finished = {}
+
+    monkeypatch.setattr("herg.pipeline.get_conn", lambda **kwargs: _DummyConnection())
+    monkeypatch.setattr("herg.pipeline.ensure_measurement_ingest_schema", lambda cur: None)
+    monkeypatch.setattr("herg.pipeline.load_endpoint", lambda cur, endpoint_key: SimpleNamespace(endpoint_id=99))
+    monkeypatch.setattr("herg.pipeline.start_ingestion_run", lambda cur, **kwargs: 77)
+    monkeypatch.setattr("herg.pipeline.finish_ingestion_run", lambda cur, **kwargs: finished.update(kwargs))
+
+    class Adapter:
+        source_name = "fixture_validation_failure"
+        effective_config = {"fixture": "validation_failure"}
+
+        def iter_raw_rows(self):
+            yield {"external_key": "row:validation_failure"}
+
+        def enrich_batch(self, rows):
+            return rows
+
+        def map_row(self, row):
+            return StagedRecord(
+                external_key=row["external_key"],
+                compound=CompoundInput(),
+                source_record=SourceRecordInput(
+                    source_name=self.source_name,
+                    source_record_key=row["external_key"],
+                    record_type="fixture",
+                ),
+                measurement=Ic50Input(
+                    ic50_value=100.0,
+                    ic50_unit="nM",
+                    qualifier="=",
+                    endpoint="IC50",
+                ),
+            )
+
+    with pytest.raises(ValueError, match="Compound requires at least one identifier"):
+        run_pipeline(
+            Adapter(),
+            DbConfig(host="localhost", port=5432, dbname="herg", user="herg_user", password="change_me"),
+            RunConfig(dry_run=False, fail_fast=True),
+        )
+
+    assert finished["status"] == "failed"
+    assert finished["counters"]["rows_seen"] == 1
+    assert finished["counters"]["rows_failed"] == 0
+    assert finished["counters"]["rows_skipped"] == 1

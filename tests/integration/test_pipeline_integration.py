@@ -114,7 +114,9 @@ def test_pipeline_dual_writes_generic_results_and_preserves_ic50_idempotence():
     second_stats = run_pipeline(adapter, db_config, run_config)
 
     assert first_stats.stored == 1
-    assert second_stats.stored == 1
+    assert first_stats.updated == 0
+    assert second_stats.stored == 0
+    assert second_stats.updated == 1
 
     with get_conn(db_config=db_config) as conn, conn.cursor() as cur:
         cur.execute(
@@ -141,13 +143,17 @@ def test_pipeline_dual_writes_generic_results_and_preserves_ic50_idempotence():
 
         cur.execute(
             """
-            SELECT COUNT(*), ARRAY_AGG(status ORDER BY ingestion_run_id)
+            SELECT
+                COUNT(*),
+                ARRAY_AGG(status ORDER BY ingestion_run_id),
+                ARRAY_AGG(rows_inserted ORDER BY ingestion_run_id),
+                ARRAY_AGG(rows_updated ORDER BY ingestion_run_id)
             FROM ingestion_runs
             WHERE source_name = %s
             """,
             (adapter.source_name,),
         )
-        run_count, run_statuses = cur.fetchone()
+        run_count, run_statuses, run_inserted, run_updated = cur.fetchone()
 
         cur.execute(
             """
@@ -183,6 +189,8 @@ def test_pipeline_dual_writes_generic_results_and_preserves_ic50_idempotence():
         assert pic50_qualifier == "="
         assert run_count == 2
         assert run_statuses == ["succeeded", "succeeded"]
+        assert run_inserted == [1, 0]
+        assert run_updated == [0, 1]
         assert generic[0] == 1
         assert generic[1] == "herg_ic50"
         assert generic[2] is not None
