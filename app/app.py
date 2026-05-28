@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import socket
+import urllib.error
 import uuid
 from typing import Any
 
@@ -8,7 +10,14 @@ import streamlit as st
 from psycopg.errors import UniqueViolation
 
 from bioactivity.db import upsert_bioactivity_result
-from bioactivity.endpoints import EndpointConfig, list_active_endpoints, load_endpoint
+from bioactivity.endpoint_search import EndpointSearchResult, search_endpoints, save_endpoint_candidate
+from bioactivity.endpoints import (
+    DuplicateEndpointKeyError,
+    EndpointConfig,
+    EndpointConfigError,
+    list_active_endpoints,
+    load_endpoint,
+)
 from bioactivity.models import MeasurementInput, measurement_from_ic50
 from bioactivity.preview import PreviewExample, PreviewResult, preview_endpoint_source
 from bioactivity.results import (
@@ -17,6 +26,7 @@ from bioactivity.results import (
     format_bioactivity_result_row,
     manual_entry_schema,
 )
+from bioactivity.source_discovery import EndpointCandidate, SourceDiscoveryError
 from bioactivity.ui_ingestion import UiIngestionRequest, UiIngestionResult, run_ui_ingestion
 from herg.config import HttpConfig
 from herg.db import get_conn, upsert_compound, upsert_ic50_result, upsert_source_record
@@ -37,6 +47,24 @@ DEFAULT_INGESTION_MAX_RECORDS = 100
 DEFAULT_INGESTION_REQUEST_TIMEOUT_SECONDS = 45
 DEFAULT_INGESTION_HTTP_RETRIES = 4
 DEFAULT_INGESTION_COMMIT_EVERY = 500
+ENDPOINT_SELECTOR_WIDGET_KEY = "endpoint_selector_key"
+ENDPOINT_SELECTOR_OVERRIDE_KEY = "endpoint_selector_pending_key"
+ENDPOINT_SEARCH_RESULT_KEY = "endpoint_search_result"
+ENDPOINT_SEARCH_PARAMS_KEY = "endpoint_search_params"
+ENDPOINT_SEARCH_MESSAGE_KEY = "endpoint_search_message"
+
+ENDPOINT_SEARCH_MEASUREMENT_OPTIONS = [
+    "Auto",
+    "IC50",
+    "EC50",
+    "AC50",
+    "Ki",
+    "Kd",
+    "Potency",
+    "percent inhibition",
+    "activity outcome",
+]
+ENDPOINT_SEARCH_SOURCE_OPTIONS = ["ChEMBL"]
 
 
 def build_compound_label(compound: dict[str, Any]) -> str:
@@ -76,11 +104,338 @@ def load_active_endpoint_options() -> list[EndpointConfig]:
         return list_active_endpoints(conn)
 
 
+def _endpoint_by_key(endpoints: list[EndpointConfig]) -> dict[str, EndpointConfig]:
+    return {endpoint.endpoint_key: endpoint for endpoint in endpoints}
+
+
 def _default_endpoint_index(endpoints: list[EndpointConfig]) -> int:
     for index, endpoint in enumerate(endpoints):
         if endpoint.endpoint_key == "herg_ic50":
             return index
     return 0
+
+
+def _default_endpoint_key(endpoints: list[EndpointConfig]) -> str:
+    return endpoints[_default_endpoint_index(endpoints)].endpoint_key
+
+
+def _select_endpoint_from_options(endpoints: list[EndpointConfig]) -> EndpointConfig:
+    endpoint_options = _endpoint_by_key(endpoints)
+    endpoint_keys = list(endpoint_options)
+
+    pending_endpoint_key = st.session_state.pop(ENDPOINT_SELECTOR_OVERRIDE_KEY, None)
+    if pending_endpoint_key in endpoint_options:
+        st.session_state[ENDPOINT_SELECTOR_WIDGET_KEY] = pending_endpoint_key
+    elif st.session_state.get(ENDPOINT_SELECTOR_WIDGET_KEY) not in endpoint_options:
+        st.session_state[ENDPOINT_SELECTOR_WIDGET_KEY] = _default_endpoint_key(endpoints)
+
+    selected_endpoint_key = st.selectbox(
+        "Endpoint",
+        options=endpoint_keys,
+        format_func=lambda key: endpoint_label(endpoint_options[key]),
+        key=ENDPOINT_SELECTOR_WIDGET_KEY,
+    )
+    return endpoint_options[selected_endpoint_key]
+
+
+def _queue_endpoint_selection(endpoint_key: str) -> None:
+    st.session_state[ENDPOINT_SELECTOR_OVERRIDE_KEY] = endpoint_key
+
+
+def _rerun_app() -> None:
+    rerun = getattr(st, "rerun", None)
+    if callable(rerun):
+        rerun()
+
+
+def _target_display(*, target_name: str | None, gene_symbol: str | None, organism: str | None) -> str:
+    parts = [value for value in (target_name, gene_symbol, organism) if value]
+    return " / ".join(parts) if parts else "-"
+
+
+def _measurement_display(
+    *,
+    measurement_type: str | None,
+    value_kind: str | None,
+    canonical_unit: str | None = None,
+) -> str:
+    parts = [value for value in (measurement_type, value_kind, canonical_unit) if value]
+    return " / ".join(parts) if parts else "-"
+
+
+def _candidate_target(candidate: EndpointCandidate) -> dict[str, Any]:
+    spec = candidate.spec if isinstance(candidate.spec, dict) else {}
+    target = spec.get("target")
+    return dict(target) if isinstance(target, dict) else {}
+
+
+def _candidate_measurement(candidate: EndpointCandidate) -> dict[str, Any]:
+    spec = candidate.spec if isinstance(candidate.spec, dict) else {}
+    measurement = spec.get("measurement")
+    return dict(measurement) if isinstance(measurement, dict) else {}
+
+
+def _source_availability_display(candidate: EndpointCandidate) -> str:
+    rows: list[str] = []
+    for availability in candidate.source_availability:
+        count = availability.approximate_count
+        count_text = f"{count:,}" if count is not None else "unknown"
+        rows.append(
+            f"{availability.source_name}: {availability.measurement_type} "
+            f"on {availability.source_target_id} ({count_text} records)"
+        )
+    return "; ".join(rows) if rows else "-"
+
+
+def saved_endpoint_display_data(saved_endpoint: Any) -> dict[str, Any]:
+    canonical_unit = getattr(saved_endpoint, "canonical_unit", None) or "-"
+    return {
+        "display_name": getattr(saved_endpoint, "display_name", ""),
+        "endpoint_key": getattr(saved_endpoint, "endpoint_key", ""),
+        "target": _target_display(
+            target_name=getattr(saved_endpoint, "target_name", None),
+            gene_symbol=getattr(saved_endpoint, "gene_symbol", None),
+            organism=getattr(saved_endpoint, "organism", None),
+        ),
+        "measurement": _measurement_display(
+            measurement_type=getattr(saved_endpoint, "measurement_type", None),
+            value_kind=getattr(saved_endpoint, "value_kind", None),
+            canonical_unit=canonical_unit,
+        ),
+        "sources": ", ".join(getattr(saved_endpoint, "source_names", ()) or ()) or "-",
+        "score": float(getattr(saved_endpoint, "score", 0.0)),
+    }
+
+
+def candidate_display_data(candidate: EndpointCandidate) -> dict[str, Any]:
+    target = _candidate_target(candidate)
+    measurement = _candidate_measurement(candidate)
+    return {
+        "display_name": candidate.display_name,
+        "candidate_key": candidate.candidate_key,
+        "target": _target_display(
+            target_name=target.get("preferred_name"),
+            gene_symbol=target.get("gene_symbol"),
+            organism=target.get("organism"),
+        ),
+        "measurement_type": measurement.get("type") or "-",
+        "source_availability": _source_availability_display(candidate),
+        "warnings": tuple(candidate.warnings),
+        "score": float(candidate.score),
+    }
+
+
+def _endpoint_search_error_message(exc: Exception) -> str:
+    cause = exc.__cause__ or exc
+    if isinstance(cause, (TimeoutError, socket.timeout)):
+        return "Endpoint discovery timed out. Try again or narrow the search."
+    if isinstance(cause, urllib.error.HTTPError):
+        return f"Endpoint discovery returned HTTP {cause.code}. Try again later."
+    if isinstance(cause, urllib.error.URLError):
+        return "Endpoint discovery could not reach the external source. Try again later."
+    if isinstance(exc, SourceDiscoveryError):
+        return "Endpoint discovery failed. Saved endpoint matches, if any, are still available."
+    return "Endpoint search failed. Please check the search inputs and try again."
+
+
+def _render_debug_exception(exc: Exception) -> None:
+    with st.expander("Debug details"):
+        st.caption(str(exc))
+
+
+def _clean_endpoint_search_sources(source_labels: list[str]) -> tuple[str, ...]:
+    sources: list[str] = []
+    for source_label in source_labels:
+        source = str(source_label or "").strip().lower()
+        if source == "chembl":
+            sources.append("chembl")
+    return tuple(sources)
+
+
+def _store_endpoint_search_result(result: EndpointSearchResult, *, params: dict[str, Any]) -> None:
+    st.session_state[ENDPOINT_SEARCH_RESULT_KEY] = result
+    st.session_state[ENDPOINT_SEARCH_PARAMS_KEY] = params
+
+
+def _set_endpoint_search_message(kind: str, message: str) -> None:
+    st.session_state[ENDPOINT_SEARCH_MESSAGE_KEY] = {"kind": kind, "message": message}
+
+
+def _render_endpoint_search_message() -> None:
+    message = st.session_state.pop(ENDPOINT_SEARCH_MESSAGE_KEY, None)
+    if not isinstance(message, dict):
+        return
+
+    kind = message.get("kind")
+    text = str(message.get("message") or "")
+    if not text:
+        return
+    if kind == "success":
+        st.success(text)
+    elif kind == "warning":
+        st.warning(text)
+    elif kind == "error":
+        st.error(text)
+    else:
+        st.info(text)
+
+
+def _select_saved_endpoint_for_flow(endpoint_key: str, *, action: str) -> None:
+    _queue_endpoint_selection(endpoint_key)
+    if action == "preview":
+        message = "Endpoint selected. Use the Ingest tab to preview source rows."
+    elif action == "ingest":
+        message = "Endpoint selected. Use the Ingest tab to run ingestion."
+    else:
+        message = "Endpoint selected for the existing workflows."
+    _set_endpoint_search_message("success", message)
+    st.success(message)
+    _rerun_app()
+
+
+def _save_endpoint_candidate_from_ui(candidate: EndpointCandidate, *, select_after_save: bool) -> None:
+    try:
+        with get_conn() as conn:
+            saved_endpoint = save_endpoint_candidate(conn, candidate)
+            loaded_endpoint = load_endpoint(conn, saved_endpoint.endpoint_key)
+    except DuplicateEndpointKeyError as exc:
+        st.error("An endpoint with that key already exists with a different configuration.")
+        _render_debug_exception(exc)
+        return
+    except EndpointConfigError as exc:
+        st.error(f"The endpoint candidate is not valid: {exc}")
+        _render_debug_exception(exc)
+        return
+    except Exception as exc:
+        st.error("The endpoint could not be saved to the database.")
+        _render_debug_exception(exc)
+        return
+
+    if select_after_save:
+        _queue_endpoint_selection(loaded_endpoint.endpoint_key)
+        message = f"Saved and selected endpoint: {endpoint_label(loaded_endpoint)}."
+    else:
+        message = f"Saved endpoint: {endpoint_label(loaded_endpoint)}."
+    _set_endpoint_search_message("success", message)
+    st.success(message)
+    if select_after_save:
+        _rerun_app()
+
+
+def render_saved_endpoint_search_result(saved_endpoint: Any) -> None:
+    display = saved_endpoint_display_data(saved_endpoint)
+    endpoint_key = display["endpoint_key"]
+
+    st.markdown(f"#### {display['display_name']}")
+    st.caption(f"Endpoint key: `{endpoint_key}`")
+    st.write(f"Target: {display['target']}")
+    st.write(f"Measurement: {display['measurement']}")
+    st.write(f"Configured sources: {display['sources']}")
+
+    select_key = f"select_saved_endpoint_{endpoint_key}"
+    preview_key = f"preview_saved_endpoint_{endpoint_key}"
+    ingest_key = f"ingest_saved_endpoint_{endpoint_key}"
+    if st.button("Select", key=select_key):
+        _select_saved_endpoint_for_flow(endpoint_key, action="select")
+    if st.button("Preview", key=preview_key):
+        _select_saved_endpoint_for_flow(endpoint_key, action="preview")
+    if st.button("Ingest", key=ingest_key):
+        _select_saved_endpoint_for_flow(endpoint_key, action="ingest")
+
+
+def render_endpoint_candidate_search_result(candidate: EndpointCandidate) -> None:
+    display = candidate_display_data(candidate)
+    candidate_key = display["candidate_key"]
+
+    st.markdown(f"#### {display['display_name']}")
+    st.caption(f"Candidate key: `{candidate_key}`")
+    st.write(f"Target: {display['target']}")
+    st.write(f"Measurement type: {display['measurement_type']}")
+    st.write(f"Source availability: {display['source_availability']}")
+    st.write(f"Score: {display['score']:.1f}")
+    if display["warnings"]:
+        st.warning("\n".join(str(warning) for warning in display["warnings"]))
+
+    save_key = f"save_candidate_{candidate_key}"
+    save_select_key = f"save_select_candidate_{candidate_key}"
+    if st.button("Save endpoint", key=save_key):
+        _save_endpoint_candidate_from_ui(candidate, select_after_save=False)
+    if st.button("Save and select", key=save_select_key):
+        _save_endpoint_candidate_from_ui(candidate, select_after_save=True)
+
+
+def render_endpoint_search_results(result: EndpointSearchResult) -> None:
+    if result.warnings:
+        st.warning("\n".join(str(warning) for warning in result.warnings))
+
+    st.markdown("### Saved Endpoints")
+    if not result.saved_endpoints:
+        st.info("No saved endpoints matched this search.")
+    for saved_endpoint in result.saved_endpoints:
+        render_saved_endpoint_search_result(saved_endpoint)
+        st.divider()
+
+    st.markdown("### Endpoint Candidates")
+    if not result.candidates:
+        st.info("No source-backed endpoint candidates matched this search.")
+    for candidate in result.candidates:
+        render_endpoint_candidate_search_result(candidate)
+        st.divider()
+
+
+def render_find_endpoint_tab() -> None:
+    st.subheader("Find Endpoint")
+    _render_endpoint_search_message()
+
+    search_query = st.text_input("Search", key="endpoint_search_query", placeholder="hERG IC50")
+    organism = st.text_input("Organism", value="Homo sapiens", key="endpoint_search_organism")
+    measurement_type = st.selectbox(
+        "Measurement type",
+        options=ENDPOINT_SEARCH_MEASUREMENT_OPTIONS,
+        index=0,
+        key="endpoint_search_measurement_type",
+    )
+    source_labels = st.multiselect(
+        "Sources",
+        options=ENDPOINT_SEARCH_SOURCE_OPTIONS,
+        default=["ChEMBL"],
+        key="endpoint_search_sources",
+    )
+
+    if st.button("Search", key="endpoint_search_button"):
+        clean_query = clean_text(search_query)
+        if not clean_query:
+            st.error("Enter an endpoint search query.")
+        else:
+            sources = _clean_endpoint_search_sources(list(source_labels))
+            selected_measurement_type = None if measurement_type == "Auto" else measurement_type
+            params = {
+                "query": clean_query,
+                "organism": clean_text(organism) or None,
+                "measurement_type": selected_measurement_type,
+                "sources": sources,
+            }
+            try:
+                with st.spinner("Searching endpoints..."):
+                    with get_conn() as conn:
+                        result = search_endpoints(
+                            conn,
+                            clean_query,
+                            sources=sources,
+                            organism=params["organism"],
+                            measurement_type=selected_measurement_type,
+                        )
+                _store_endpoint_search_result(result, params=params)
+            except Exception as exc:
+                st.error(_endpoint_search_error_message(exc))
+                _render_debug_exception(exc)
+
+    result = st.session_state.get(ENDPOINT_SEARCH_RESULT_KEY)
+    params = st.session_state.get(ENDPOINT_SEARCH_PARAMS_KEY)
+    if isinstance(params, dict) and params.get("query"):
+        st.caption(f"Showing most recent results for: {params['query']}")
+    if result is not None:
+        render_endpoint_search_results(result)
 
 
 def import_compounds_csv(df: pd.DataFrame) -> dict[str, Any]:
@@ -1005,29 +1360,25 @@ def main() -> None:
         st.error("No active endpoints found.")
         st.stop()
 
-    labels = [endpoint_label(endpoint) for endpoint in endpoints]
-    selected_label = st.selectbox(
-        "Endpoint",
-        options=labels,
-        index=_default_endpoint_index(endpoints),
-    )
-    selected_endpoint = endpoints[labels.index(selected_label)]
+    selected_endpoint = _select_endpoint_from_options(endpoints)
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["Add Compound", "Add Measurement", "Upload CSV", "Ingest", "Browse Results", "Dashboard"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        ["Find Endpoint", "Add Compound", "Add Measurement", "Upload CSV", "Ingest", "Browse Results", "Dashboard"]
     )
 
     with tab1:
-        render_compound_tab()
+        render_find_endpoint_tab()
     with tab2:
-        render_measurement_tab(selected_endpoint)
+        render_compound_tab()
     with tab3:
-        render_upload_tab(selected_endpoint)
+        render_measurement_tab(selected_endpoint)
     with tab4:
-        render_ingest_tab(selected_endpoint)
+        render_upload_tab(selected_endpoint)
     with tab5:
-        render_browse_tab(selected_endpoint)
+        render_ingest_tab(selected_endpoint)
     with tab6:
+        render_browse_tab(selected_endpoint)
+    with tab7:
         render_dashboard_tab(selected_endpoint)
 
 
