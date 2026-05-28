@@ -89,7 +89,7 @@ Useful PubChem flags:
 
 ### IC50 compatibility strategy
 
-`bioactivity_results` is the primary endpoint result table. The legacy `ic50_results` table and `ic50_result_summary_v` view are retained for existing hERG IC50 consumers. IC50 ingestion paths intentionally dual-write to both `ic50_results` and `bioactivity_results`; tests assert that the duplicated values stay consistent.
+`bioactivity_results` is the primary endpoint result table. The legacy `ic50_results` table and `ic50_result_summary_v` view are retained for existing hERG IC50 consumers. The `herg_ic50` endpoint intentionally dual-writes to both `ic50_results` and `bioactivity_results`; other endpoints write only to `bioactivity_results` so legacy hERG consumers do not see non-hERG measurements.
 
 ## Identifier Enrichment
 
