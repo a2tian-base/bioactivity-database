@@ -59,4 +59,21 @@ def test_histogram_chart_data_formats_x_axis_labels_to_two_decimals():
     chart_data = module.histogram_chart_data(histogram_counts)
 
     assert list(chart_data.columns) == ["count"]
-    assert all(re.fullmatch(r"-?\d+\.\d{2}", label) for label in chart_data.index)
+    assert chart_data.index.name == "bin"
+    assert chart_data.index.is_unique
+    assert all(
+        re.fullmatch(r"-?\d+\.\d{2} to -?\d+\.\d{2}", label) for label in chart_data.index
+    )
+
+
+def test_histogram_chart_data_keeps_narrow_bin_labels_unique():
+    module = importlib.import_module("app")
+    values = pd.Series([7.0 + (step * 0.001) for step in range(31)])
+    histogram_counts = module.build_histogram_counts(values, bins=30)
+
+    rounded_starts = histogram_counts["bin_start"].map(lambda value: f"{value:.2f}")
+    chart_data = module.histogram_chart_data(histogram_counts)
+
+    assert not rounded_starts.is_unique
+    assert chart_data.index.is_unique
+    assert len(chart_data) == len(histogram_counts)
