@@ -13,10 +13,11 @@ from herg.config import DbConfig, HttpConfig
 from herg.db import get_conn
 from herg.models import StagedRecord
 from herg.normalize import clean_text
+from herg.pipeline import _validate_staged_record
 from herg.sources.chembl import ChemblAdapter, measurement_input_from_chembl_record
 from herg.sources.pubchem import PubChemAdapter, measurement_input_from_pubchem_record
 
-from .endpoints import EndpointConfig, get_source_config, load_endpoint
+from .endpoints import EndpointConfig, EndpointConfigError, get_source_config, load_endpoint
 from .models import MeasurementInput, measurement_from_ic50
 
 
@@ -41,7 +42,7 @@ class PreviewAdapter(Protocol):
         ...
 
 
-AdapterFactory = Callable[[EndpointConfig, dict[str, Any], HttpConfig], PreviewAdapter]
+AdapterFactory = Callable[[EndpointConfig, dict[str, Any], HttpConfig, int], PreviewAdapter]
 MeasurementFactory = Callable[[StagedRecord], MeasurementInput]
 
 
@@ -69,11 +70,26 @@ class PreviewResult:
     warnings: list[str] = field(default_factory=list)
 
 
-def _chembl_factory(endpoint: EndpointConfig, source_config: dict[str, Any], http_config: HttpConfig) -> PreviewAdapter:
-    return ChemblAdapter.from_source_config(endpoint, source_config, http_config=http_config)
+def _chembl_factory(
+    endpoint: EndpointConfig,
+    source_config: dict[str, Any],
+    http_config: HttpConfig,
+    limit: int,
+) -> PreviewAdapter:
+    return ChemblAdapter.from_source_config(
+        endpoint,
+        source_config,
+        http_config=http_config,
+        activity_page_size=limit,
+    )
 
 
-def _pubchem_factory(endpoint: EndpointConfig, source_config: dict[str, Any], http_config: HttpConfig) -> PreviewAdapter:
+def _pubchem_factory(
+    endpoint: EndpointConfig,
+    source_config: dict[str, Any],
+    http_config: HttpConfig,
+    limit: int,
+) -> PreviewAdapter:
     return PubChemAdapter.from_source_config(endpoint, source_config, http_config=http_config)
 
 
@@ -178,7 +194,7 @@ def preview_endpoint_source(
 
     endpoint = load_endpoint(conn_or_cur, endpoint_key)
     source_config = get_source_config(endpoint, normalized_source_name)
-    adapter = factories[normalized_source_name](endpoint, source_config, http_config or HttpConfig())
+    adapter = factories[normalized_source_name](endpoint, source_config, http_config or HttpConfig(), limit)
     measurement_factory_map = dict(measurement_factories or DEFAULT_MEASUREMENT_FACTORIES)
 
     raw_rows = _iter_limited_rows(adapter, limit)
@@ -201,6 +217,7 @@ def preview_endpoint_source(
         external_key = clean_text(row.get("external_key", "")) if isinstance(row, Mapping) else ""
         try:
             staged = adapter.map_row(row)
+            _validate_staged_record(staged)
             measurement = _measurement_from_record(staged, normalized_source_name, measurement_factory_map)
             accepted_count += 1
             accepted_examples.append(
@@ -331,14 +348,18 @@ def main(argv: list[str] | None = None) -> int:
         http_retries=args.http_retries,
     )
     db_config = _db_config_from_args(args)
-    with get_conn(db_config=db_config) as conn:
-        result = preview_endpoint_source(
-            conn,
-            endpoint_key=args.endpoint_key,
-            source_name=args.source_name,
-            limit=args.limit,
-            http_config=http_config,
-        )
+    try:
+        with get_conn(db_config=db_config) as conn:
+            result = preview_endpoint_source(
+                conn,
+                endpoint_key=args.endpoint_key,
+                source_name=args.source_name,
+                limit=args.limit,
+                http_config=http_config,
+            )
+    except (EndpointConfigError, PreviewError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     print(format_preview_result(result))
     return 0
 
