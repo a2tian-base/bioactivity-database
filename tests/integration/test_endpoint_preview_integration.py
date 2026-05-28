@@ -7,6 +7,7 @@ from bioactivity import preview as preview_module
 from bioactivity.endpoints import EndpointConfig, MissingSourceConfigError
 from bioactivity.preview import (
     PreviewExample,
+    PreviewError,
     PreviewResult,
     UnsupportedSourceError,
     format_preview_result,
@@ -186,6 +187,23 @@ def test_preview_main_returns_config_errors_without_traceback(monkeypatch, capsy
     assert captured.out == ""
     assert "Unsupported source 'unichem'." in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_preview_wraps_adapter_config_errors(monkeypatch):
+    def raise_adapter_config_error(endpoint, source_config, http_config, limit):
+        raise ValueError("ChEMBL source config requires 'target_chembl_id'.")
+
+    monkeypatch.setattr(preview_module, "load_endpoint", lambda conn_or_cur, endpoint_key: _endpoint_fixture())
+
+    with pytest.raises(PreviewError, match="Invalid source config for 'chembl'") as exc_info:
+        preview_endpoint_source(
+            object(),
+            endpoint_key="herg_ic50",
+            source_name="chembl",
+            adapter_factories={"chembl": raise_adapter_config_error},
+        )
+
+    assert "target_chembl_id" in str(exc_info.value)
 
 
 @requires_db
