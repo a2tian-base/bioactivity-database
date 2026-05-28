@@ -35,11 +35,15 @@ _MEASUREMENT_TERM_MAP = {
     "activation": "activation",
     "outcome": "outcome",
 }
+
+
+def _measurement_term_pattern(term: str) -> str:
+    term_pattern = r"\s+".join(re.escape(part) for part in term.split())
+    return rf"(?<![0-9A-Za-z]){term_pattern}(?![0-9A-Za-z])"
+
+
 _MEASUREMENT_PATTERN = re.compile(
-    "|".join(
-        rf"(?<![0-9A-Za-z]){r'\s+'.join(re.escape(part) for part in term.split())}(?![0-9A-Za-z])"
-        for term in _MEASUREMENT_TERMS
-    ),
+    "|".join(_measurement_term_pattern(term) for term in _MEASUREMENT_TERMS),
     re.IGNORECASE,
 )
 _HUMAN_PATTERN = re.compile(r"(?<![0-9A-Za-z])human(?![0-9A-Za-z])", re.IGNORECASE)

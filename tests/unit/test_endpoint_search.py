@@ -159,6 +159,14 @@ def test_parse_endpoint_query_for_cyp3a4_inhibition():
     assert parsed.organism is None
 
 
+def test_parse_endpoint_query_for_percent_inhibition():
+    parsed = parse_endpoint_query("hERG percent inhibition")
+
+    assert parsed.target_query == "hERG"
+    assert parsed.measurement_types == ("percent inhibition",)
+    assert parsed.organism is None
+
+
 def test_parse_endpoint_query_for_human_ic50():
     parsed = parse_endpoint_query("EGFR human IC50")
 
