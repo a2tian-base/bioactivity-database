@@ -173,6 +173,24 @@ def _iter_limited_rows(adapter: PreviewAdapter, limit: int) -> list[dict]:
     return rows
 
 
+def _build_preview_adapter(
+    factory: AdapterFactory,
+    endpoint: EndpointConfig,
+    source_name: str,
+    source_config: dict[str, Any],
+    http_config: HttpConfig,
+    limit: int,
+) -> PreviewAdapter:
+    try:
+        return factory(endpoint, source_config, http_config, limit)
+    except PreviewError:
+        raise
+    except EndpointConfigError:
+        raise
+    except ValueError as exc:
+        raise PreviewError(f"Invalid source config for '{source_name}': {exc}") from exc
+
+
 def preview_endpoint_source(
     conn_or_cur: psycopg.Connection | psycopg.Cursor,
     *,
@@ -194,7 +212,14 @@ def preview_endpoint_source(
 
     endpoint = load_endpoint(conn_or_cur, endpoint_key)
     source_config = get_source_config(endpoint, normalized_source_name)
-    adapter = factories[normalized_source_name](endpoint, source_config, http_config or HttpConfig(), limit)
+    adapter = _build_preview_adapter(
+        factories[normalized_source_name],
+        endpoint,
+        normalized_source_name,
+        source_config,
+        http_config or HttpConfig(),
+        limit,
+    )
     measurement_factory_map = dict(measurement_factories or DEFAULT_MEASUREMENT_FACTORIES)
 
     raw_rows = _iter_limited_rows(adapter, limit)
