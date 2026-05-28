@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import Dict, Iterable, List, Optional, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any, Dict, Iterable, List, Optional
+
+from bioactivity.endpoints import EndpointConfig
+from bioactivity.models import MeasurementInput, measurement_from_ic50
 
 from ..config import DbConfig, HttpConfig, RunConfig
 from ..http import get_json
@@ -19,12 +23,17 @@ from ..normalize import (
     dedupe_casefolded,
     normalize_ic50_unit,
     normalize_qualifier,
+    parse_bool,
+    parse_positive_int,
     parse_positive_float,
 )
 from ..pipeline import run_pipeline
 
 
 CHEMBL_BASE_URL = "https://www.ebi.ac.uk/chembl/api/data"
+DEFAULT_CHEMBL_RELATIONS = "=,<,>"
+DEFAULT_ACTIVITY_PAGE_SIZE = 1000
+DEFAULT_MOLECULE_BATCH_SIZE = 150
 ACTIVITY_ONLY_FIELDS = (
     "activity_id,"
     "assay_chembl_id,"
@@ -46,6 +55,61 @@ def _log(message: str) -> None:
     print(message, flush=True)
 
 
+def _required_config_text(source_config: Mapping[str, Any], key: str) -> str:
+    value = clean_text(source_config.get(key))
+    if not value:
+        raise ValueError(f"ChEMBL source config requires '{key}'.")
+    return value
+
+
+def _normalize_relations(value: object) -> str:
+    if value is None:
+        return DEFAULT_CHEMBL_RELATIONS
+    if isinstance(value, str):
+        relations = [clean_text(part) for part in value.split(",")]
+    elif isinstance(value, Sequence):
+        relations = [clean_text(part) for part in value]
+    else:
+        raise ValueError("ChEMBL source config 'standard_relation__in' must be a string or sequence.")
+
+    relations = [relation for relation in relations if relation]
+    if not relations:
+        raise ValueError("ChEMBL source config 'standard_relation__in' must not be empty.")
+    return ",".join(relations)
+
+
+def _optional_positive_int(value: object, default: int) -> int:
+    if value is None:
+        return default
+    return parse_positive_int(value)
+
+
+def _normalize_chembl_source_config(
+    source_config: Mapping[str, Any],
+    *,
+    activity_page_size: int | None = None,
+    molecule_batch_size: int | None = None,
+) -> dict[str, object]:
+    if not isinstance(source_config, Mapping):
+        raise ValueError("ChEMBL source config must be a mapping.")
+
+    data_validity_value = source_config.get("data_validity_comment__isnull", True)
+    config_activity_page_size = source_config.get("page_size", source_config.get("activity_page_size"))
+
+    return {
+        "target_chembl_id": _required_config_text(source_config, "target_chembl_id"),
+        "standard_type": _required_config_text(source_config, "standard_type"),
+        "relations": _normalize_relations(source_config.get("standard_relation__in")),
+        "data_validity_comment_isnull": parse_bool(data_validity_value),
+        "activity_page_size": activity_page_size
+        if activity_page_size is not None
+        else _optional_positive_int(config_activity_page_size, DEFAULT_ACTIVITY_PAGE_SIZE),
+        "molecule_batch_size": molecule_batch_size
+        if molecule_batch_size is not None
+        else _optional_positive_int(source_config.get("molecule_batch_size"), DEFAULT_MOLECULE_BATCH_SIZE),
+    }
+
+
 class ChemblAdapter:
     source_name = "chembl"
 
@@ -58,6 +122,7 @@ class ChemblAdapter:
         relations: str,
         activity_page_size: int,
         molecule_batch_size: int,
+        data_validity_comment_isnull: bool = True,
     ) -> None:
         self.http_config = http_config
         self.base_url = base_url.rstrip("/")
@@ -66,8 +131,47 @@ class ChemblAdapter:
         self.relations = relations
         self.activity_page_size = activity_page_size
         self.molecule_batch_size = molecule_batch_size
+        self.data_validity_comment_isnull = data_validity_comment_isnull
         self.enrich_batch_size = max(1, activity_page_size)
         self.release = self._fetch_release()
+
+    @classmethod
+    def from_source_config(
+        cls,
+        endpoint: EndpointConfig,
+        source_config: Mapping[str, Any],
+        *,
+        http_config: HttpConfig,
+        base_url: str = CHEMBL_BASE_URL,
+        activity_page_size: int | None = None,
+        molecule_batch_size: int | None = None,
+    ) -> "ChemblAdapter":
+        config = _normalize_chembl_source_config(
+            source_config,
+            activity_page_size=activity_page_size,
+            molecule_batch_size=molecule_batch_size,
+        )
+        return cls(
+            http_config=http_config,
+            base_url=base_url,
+            target_chembl_id=str(config["target_chembl_id"]),
+            standard_type=str(config["standard_type"]),
+            relations=str(config["relations"]),
+            data_validity_comment_isnull=bool(config["data_validity_comment_isnull"]),
+            activity_page_size=int(config["activity_page_size"]),
+            molecule_batch_size=int(config["molecule_batch_size"]),
+        )
+
+    @property
+    def effective_config(self) -> dict[str, object]:
+        return {
+            "target_chembl_id": self.target_chembl_id,
+            "standard_type": self.standard_type,
+            "standard_relation__in": self.relations,
+            "data_validity_comment__isnull": self.data_validity_comment_isnull,
+            "activity_page_size": self.activity_page_size,
+            "molecule_batch_size": self.molecule_batch_size,
+        }
 
     def _fetch_release(self) -> str:
         status_url = f"{self.base_url}/status.json"
@@ -84,7 +188,7 @@ class ChemblAdapter:
                 "target_chembl_id": self.target_chembl_id,
                 "standard_type": self.standard_type,
                 "standard_relation__in": self.relations,
-                "data_validity_comment__isnull": "true",
+                "data_validity_comment__isnull": "true" if self.data_validity_comment_isnull else "false",
                 "only": ACTIVITY_ONLY_FIELDS,
                 "limit": self.activity_page_size,
                 "offset": offset,
@@ -206,6 +310,20 @@ class ChemblAdapter:
             if value:
                 names.append(str(value))
         return dedupe_casefolded(names)[:50]
+
+
+def measurement_input_from_chembl_record(record: StagedRecord) -> MeasurementInput:
+    activity = record.source_record.raw_payload.get("activity") or {}
+    assay_chembl_id = clean_text(activity.get("assay_chembl_id"))
+    assay_context = {"assay_chembl_id": assay_chembl_id} if assay_chembl_id else {}
+    return measurement_from_ic50(
+        result_key=record.external_key,
+        ic50_value=record.measurement.ic50_value,
+        ic50_unit=record.measurement.ic50_unit,
+        qualifier=record.measurement.qualifier,
+        assay_context=assay_context,
+        quality_flags={"source": ChemblAdapter.source_name},
+    )
 
 
 def _build_db_config(args: argparse.Namespace) -> DbConfig:
