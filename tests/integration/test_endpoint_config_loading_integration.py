@@ -102,6 +102,25 @@ def test_load_seeded_herg_endpoint_validates_and_returns_source_configs():
         assert endpoint.source_config("pubchem")["target_gene_id"] == "3757"
 
 
+def test_load_seeded_cyp3a4_endpoint_uses_generic_ic50_config():
+    db_config = DbConfig.from_env()
+
+    with get_conn(db_config=db_config) as conn, conn.cursor() as cur:
+        endpoint = load_endpoint(cur, "cyp3a4_ic50")
+        cur.execute("SELECT to_regclass('cyp3a4_ic50_results')")
+        endpoint_specific_table = cur.fetchone()[0]
+
+        assert endpoint.endpoint_key == "cyp3a4_ic50"
+        assert endpoint.display_name == "CYP3A4 IC50"
+        assert endpoint.active is True
+        assert endpoint.spec["measurement"]["type"] == "IC50"
+        assert endpoint.spec["measurement"]["value_kind"] == "concentration"
+        assert endpoint.spec["target"]["gene_symbol"] == "CYP3A4"
+        assert get_source_config(endpoint, "chembl")["target_chembl_id"] == "CHEMBL340"
+        assert endpoint.source_config("pubchem")["target_gene_id"] == "1576"
+        assert endpoint_specific_table is None
+
+
 def test_load_endpoint_accepts_connection_objects():
     db_config = DbConfig.from_env()
 

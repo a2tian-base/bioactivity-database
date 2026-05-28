@@ -368,6 +368,74 @@ DO UPDATE SET
     spec_hash = EXCLUDED.spec_hash,
     active = EXCLUDED.active;
 
+WITH cyp3a4_ic50_endpoint AS (
+    SELECT
+        'cyp3a4_ic50'::TEXT AS endpoint_key,
+        'CYP3A4 IC50'::TEXT AS display_name,
+        '{
+          "target": {
+            "preferred_name": "Cytochrome P450 3A4",
+            "gene_symbol": "CYP3A4",
+            "organism": "Homo sapiens",
+            "identifiers": {
+              "chembl_target_id": "CHEMBL340",
+              "ncbi_gene_id": "1576"
+            }
+          },
+          "measurement": {
+            "type": "IC50",
+            "value_kind": "concentration",
+            "canonical_unit": "uM",
+            "supports_p_value": true,
+            "p_value_name": "pIC50"
+          },
+          "normalization": {
+            "allowed_units": ["pM", "nM", "uM", "mM"],
+            "allowed_relations": ["=", "<", ">"]
+          },
+          "inclusion_criteria": {
+            "organism": "Homo sapiens",
+            "direct_target_only": true
+          }
+        }'::JSONB AS spec,
+        '{
+          "chembl": {
+            "target_chembl_id": "CHEMBL340",
+            "standard_type": "IC50",
+            "standard_relation__in": ["=", "<", ">"],
+            "data_validity_comment__isnull": true
+          },
+          "pubchem": {
+            "target_gene_symbol": "CYP3A4",
+            "target_gene_id": "1576",
+            "activity_name_regex": "(?i)\\bIC50\\b"
+          }
+        }'::JSONB AS source_configs
+)
+INSERT INTO endpoints (
+    endpoint_key,
+    display_name,
+    spec,
+    source_configs,
+    spec_hash,
+    active
+)
+SELECT
+    endpoint_key,
+    display_name,
+    spec,
+    source_configs,
+    md5(spec::TEXT || '|' || source_configs::TEXT),
+    TRUE
+FROM cyp3a4_ic50_endpoint
+ON CONFLICT (endpoint_key)
+DO UPDATE SET
+    display_name = EXCLUDED.display_name,
+    spec = EXCLUDED.spec,
+    source_configs = EXCLUDED.source_configs,
+    spec_hash = EXCLUDED.spec_hash,
+    active = EXCLUDED.active;
+
 CREATE TRIGGER trg_set_compounds_updated_at
 BEFORE UPDATE
 ON compounds

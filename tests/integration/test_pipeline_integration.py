@@ -12,6 +12,7 @@ from herg.pipeline import run_pipeline
 
 PIPELINE_FIXTURE_SOURCE = "test_fixture"
 PIPELINE_ERROR_SOURCE = "test_fixture_error"
+PIPELINE_CYP3A4_SOURCE = "test_fixture_cyp3a4"
 
 
 def _cleanup(cur, source_name: str, namespace: str) -> None:
@@ -197,6 +198,101 @@ def test_pipeline_dual_writes_generic_results_and_preserves_ic50_idempotence():
         assert generic[11] == "uM"
         assert generic[12] == pic50
         assert generic[13] == "="
+
+        _cleanup(cur, adapter.source_name, adapter.source_name)
+        conn.commit()
+
+
+@pytest.mark.skipif(os.getenv("HERG_TEST_DB") != "1", reason="set HERG_TEST_DB=1 to run")
+def test_pipeline_writes_cyp3a4_fixture_result_to_bioactivity_results():
+    db_config = DbConfig.from_env()
+
+    class Cyp3a4FixtureAdapter:
+        source_name = PIPELINE_CYP3A4_SOURCE
+        effective_config = {
+            "target_chembl_id": "CHEMBL340",
+            "standard_type": "IC50",
+        }
+
+        def iter_raw_rows(self):
+            yield {"external_key": "cyp3a4:fixture:1"}
+
+        def enrich_batch(self, rows):
+            return rows
+
+        def map_row(self, row):
+            compound = CompoundInput(
+                standard_inchikey="CYPIPELINESMOKE-UHFFFAOYSA-N",
+                identifiers=build_identifier_inputs({self.source_name: row["external_key"]}, self.source_name),
+                names=build_name_inputs(preferred_name="CYP3A4 FixtureMol"),
+            )
+            source_record = SourceRecordInput(
+                source_name=self.source_name,
+                source_record_key=row["external_key"],
+                record_type="fixture",
+            )
+            measurement = Ic50Input(
+                ic50_value=120.0,
+                ic50_unit="nM",
+                qualifier="=",
+                endpoint="IC50",
+            )
+            return StagedRecord(
+                external_key=row["external_key"],
+                compound=compound,
+                source_record=source_record,
+                measurement=measurement,
+            )
+
+    adapter = Cyp3a4FixtureAdapter()
+    run_config = RunConfig(dry_run=False, commit_every=1)
+
+    with get_conn(db_config=db_config) as conn, conn.cursor() as cur:
+        _cleanup(cur, adapter.source_name, adapter.source_name)
+        conn.commit()
+
+    stats = run_pipeline(adapter, db_config, run_config, endpoint_key="cyp3a4_ic50")
+
+    assert stats.stored == 1
+
+    with get_conn(db_config=db_config) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                COUNT(*),
+                MIN(e.endpoint_key),
+                MIN(e.spec->'target'->>'gene_symbol'),
+                MIN(br.measurement_type),
+                MIN(br.value_kind),
+                MIN(br.original_value),
+                MIN(br.original_unit),
+                MIN(br.standard_value),
+                MIN(br.standard_unit),
+                MIN(br.p_value)
+            FROM bioactivity_results br
+            JOIN endpoints e ON e.endpoint_id = br.endpoint_id
+            WHERE br.source_record_id IN (
+                SELECT source_record_id FROM source_records WHERE source_name = %s
+            )
+            """,
+            (adapter.source_name,),
+        )
+        generic = cur.fetchone()
+
+        cur.execute("SELECT to_regclass('cyp3a4_ic50_results')")
+        endpoint_specific_table = cur.fetchone()[0]
+
+        assert generic[0] == 1
+        assert generic[1] == "cyp3a4_ic50"
+        assert generic[2] == "CYP3A4"
+        assert generic[3] == "IC50"
+        assert generic[4] == "concentration"
+        assert generic[5] == Decimal("120.0")
+        assert generic[6] == "nM"
+        assert generic[7] == Decimal("0.120000")
+        assert generic[8] == "uM"
+        assert generic[9] is not None
+        assert endpoint_specific_table is None
 
         _cleanup(cur, adapter.source_name, adapter.source_name)
         conn.commit()
