@@ -43,6 +43,25 @@ def test_measurement_from_concentration_form_normalizes_allowed_units():
     assert measurement.standard_relation == "="
 
 
+def test_measurement_from_concentration_form_normalizes_to_non_um_canonical_unit():
+    module = importlib.import_module("app")
+
+    measurement = module._measurement_from_concentration_form(
+        source_record_key="manual:1",
+        measurement_type="IC50",
+        value=0.25,
+        unit="uM",
+        relation="<",
+        canonical_unit="nM",
+    )
+
+    assert measurement.original_value == Decimal("0.25")
+    assert measurement.original_unit == "uM"
+    assert measurement.standard_value == Decimal("2.5E+2")
+    assert measurement.standard_unit == "nM"
+    assert measurement.standard_relation == "<"
+
+
 def test_measurement_from_concentration_form_rejects_unconvertible_units():
     module = importlib.import_module("app")
 
