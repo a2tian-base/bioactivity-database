@@ -8,6 +8,9 @@ from typing import Any
 
 import psycopg
 
+from .endpoints import save_endpoint_candidate
+from .source_discovery import EndpointCandidate, SourceDiscoveryError, discover_endpoint_candidates
+
 
 _MEASUREMENT_TERMS = (
     "percent inhibition",
@@ -66,6 +69,13 @@ class SavedEndpointSearchResult:
     source_names: tuple[str, ...]
     active: bool
     score: float
+
+
+@dataclass(frozen=True)
+class EndpointSearchResult:
+    saved_endpoints: tuple[SavedEndpointSearchResult, ...]
+    candidates: tuple[EndpointCandidate, ...]
+    warnings: tuple[str, ...]
 
 
 def _clean_text(value: object) -> str:
@@ -129,6 +139,23 @@ def parse_endpoint_query(query: str) -> ParsedEndpointQuery:
         target_query=_clean_query_text(target_text),
         measurement_types=tuple(measurement_types),
         organism=organism,
+    )
+
+
+def _parsed_query_with_filters(
+    query: str,
+    *,
+    organism: str | None,
+    measurement_type: str | None,
+) -> ParsedEndpointQuery:
+    parsed = parse_endpoint_query(query)
+    clean_organism = _optional_text(organism)
+    clean_measurement_type = _optional_text(measurement_type)
+    return ParsedEndpointQuery(
+        raw_query=parsed.raw_query,
+        target_query=parsed.target_query,
+        measurement_types=(clean_measurement_type,) if clean_measurement_type else parsed.measurement_types,
+        organism=clean_organism or parsed.organism,
     )
 
 
@@ -293,11 +320,12 @@ def _search_from_cursor(
     *,
     limit: int,
     include_inactive: bool,
+    parsed: ParsedEndpointQuery | None = None,
 ) -> list[SavedEndpointSearchResult]:
     if limit <= 0:
         return []
 
-    parsed = parse_endpoint_query(query)
+    parsed = parsed or parse_endpoint_query(query)
     if not parsed.raw_query:
         return []
 
@@ -351,4 +379,102 @@ def search_saved_endpoints(
             query,
             limit=limit,
             include_inactive=include_inactive,
+        )
+
+
+def _clean_source_names(sources: Sequence[str]) -> tuple[str, ...]:
+    return tuple(source for source in (_clean_text(source).lower() for source in sources) if source)
+
+
+def _search_endpoints_from_cursor(
+    cur: psycopg.Cursor,
+    query: str,
+    *,
+    sources: Sequence[str],
+    organism: str | None,
+    measurement_type: str | None,
+    include_inactive: bool,
+    saved_limit: int,
+    candidate_limit: int,
+) -> EndpointSearchResult:
+    parsed = _parsed_query_with_filters(
+        query,
+        organism=organism,
+        measurement_type=measurement_type,
+    )
+    saved_endpoints = tuple(
+        _search_from_cursor(
+            cur,
+            query,
+            limit=saved_limit,
+            include_inactive=include_inactive,
+            parsed=parsed,
+        )
+    )
+    clean_sources = _clean_source_names(sources)
+    candidates: tuple[EndpointCandidate, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+    if clean_sources and candidate_limit > 0:
+        try:
+            discovery_result = discover_endpoint_candidates(
+                parsed,
+                sources=clean_sources,
+                limit=candidate_limit,
+            )
+        except Exception as exc:
+            warnings = (f"Endpoint discovery failed: {exc}",)
+            if not saved_endpoints:
+                raise SourceDiscoveryError(warnings[0]) from exc
+            return EndpointSearchResult(
+                saved_endpoints=saved_endpoints,
+                candidates=candidates,
+                warnings=warnings,
+            )
+        candidates = discovery_result.candidates
+        warnings = discovery_result.warnings
+        if discovery_result.failed_sources and len(discovery_result.failed_sources) == len(clean_sources):
+            if not saved_endpoints:
+                raise SourceDiscoveryError("; ".join(warnings) or "All endpoint discovery sources failed.")
+
+    return EndpointSearchResult(
+        saved_endpoints=saved_endpoints,
+        candidates=candidates,
+        warnings=warnings,
+    )
+
+
+def search_endpoints(
+    conn_or_cur: psycopg.Connection | psycopg.Cursor,
+    query: str,
+    *,
+    sources: Sequence[str] = ("chembl",),
+    organism: str | None = None,
+    measurement_type: str | None = None,
+    include_inactive: bool = False,
+    saved_limit: int = 20,
+    candidate_limit: int = 10,
+) -> EndpointSearchResult:
+    if hasattr(conn_or_cur, "fetchall"):
+        return _search_endpoints_from_cursor(
+            conn_or_cur,
+            query,
+            sources=sources,
+            organism=organism,
+            measurement_type=measurement_type,
+            include_inactive=include_inactive,
+            saved_limit=saved_limit,
+            candidate_limit=candidate_limit,
+        )
+
+    with conn_or_cur.cursor() as cur:
+        return _search_endpoints_from_cursor(
+            cur,
+            query,
+            sources=sources,
+            organism=organism,
+            measurement_type=measurement_type,
+            include_inactive=include_inactive,
+            saved_limit=saved_limit,
+            candidate_limit=candidate_limit,
         )
