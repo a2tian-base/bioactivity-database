@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-PubChem source adapter for hERG IC50 ingestion.
+PubChem source adapter for endpoint-driven IC50 ingestion.
+
+The hERG script entry point is retained as a compatibility wrapper and uses
+``herg_ic50`` as its default endpoint.
 """
 
 from __future__ import annotations
@@ -11,10 +14,10 @@ import sys
 from collections.abc import Mapping
 from typing import Any, Dict, Iterable, List, Pattern, Sequence
 
-from bioactivity.endpoints import EndpointConfig, get_source_config, load_endpoint
+from bioactivity.endpoints import EndpointConfig
+from bioactivity.ingest import print_ingestion_summary, run_endpoint_ingestion
 from bioactivity.models import MeasurementInput, measurement_from_ic50
 from ..config import DbConfig, HttpConfig, RunConfig
-from ..db import get_conn
 from ..http import get_csv_rows, get_json
 from ..models import CompoundInput, Ic50Input, SourceRecordInput, StagedRecord
 from ..normalize import (
@@ -25,7 +28,6 @@ from ..normalize import (
     parse_positive_float,
     parse_positive_int,
 )
-from ..pipeline import run_pipeline
 
 
 PUBCHEM_BASE_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
@@ -302,7 +304,9 @@ def _build_db_config(args: argparse.Namespace) -> DbConfig:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Ingest hERG IC50 data from PubChem.")
+    parser = argparse.ArgumentParser(
+        description="Ingest endpoint IC50 data from PubChem; defaults to the hERG compatibility endpoint."
+    )
     parser.add_argument("--endpoint-key", default="herg_ic50")
     parser.add_argument("--pubchem-base-url", default=PUBCHEM_BASE_URL)
     parser.add_argument("--target-gene-symbol", default=None)
@@ -327,8 +331,8 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _pubchem_source_config_from_args(endpoint: EndpointConfig, args: argparse.Namespace) -> dict[str, object]:
-    source_config = get_source_config(endpoint, PubChemAdapter.source_name)
+def _pubchem_source_config_overrides_from_args(args: argparse.Namespace) -> dict[str, object]:
+    source_config: dict[str, object] = {}
     if args.target_gene_symbol:
         source_config["target_gene_symbol"] = args.target_gene_symbol
     if args.target_gene_id:
@@ -354,27 +358,18 @@ def main() -> int:
     )
     db_config = _build_db_config(args)
 
-    with get_conn(db_config=db_config) as conn:
-        endpoint = load_endpoint(conn, args.endpoint_key)
-
-    adapter = PubChemAdapter.from_source_config(
-        endpoint,
-        _pubchem_source_config_from_args(endpoint, args),
+    stats = run_endpoint_ingestion(
+        endpoint_key=args.endpoint_key,
+        source_name=PubChemAdapter.source_name,
+        db_config=db_config,
         http_config=http_config,
-        base_url=args.pubchem_base_url,
+        run_config=run_config,
+        source_config_overrides=_pubchem_source_config_overrides_from_args(args),
+        pubchem_base_url=args.pubchem_base_url,
         cid_batch_size=args.cid_batch_size,
     )
 
-    stats = run_pipeline(adapter, db_config, run_config, endpoint_key=endpoint.endpoint_key)
-
-    _log("")
-    _log("Ingestion summary")
-    _log("-----------------")
-    _log(f"Source: {adapter.source_name}")
-    _log(f"Processed rows: {stats.processed}")
-    _log(f"Stored rows: {stats.stored}")
-    _log(f"Skipped invalid: {stats.skipped_invalid}")
-    _log(f"Failed inserts: {stats.failed}")
+    print_ingestion_summary(stats, source_name=PubChemAdapter.source_name)
 
     return 1 if stats.failed > 0 else 0
 

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-ChEMBL source adapter for hERG IC50 ingestion.
+ChEMBL source adapter for endpoint-driven IC50 ingestion.
+
+The hERG script entry point is retained as a compatibility wrapper and uses
+``herg_ic50`` as its default endpoint.
 """
 
 from __future__ import annotations
@@ -10,11 +13,11 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import Any, Dict, Iterable, List, Optional
 
-from bioactivity.endpoints import EndpointConfig, get_source_config, load_endpoint
+from bioactivity.endpoints import EndpointConfig
+from bioactivity.ingest import print_ingestion_summary, run_endpoint_ingestion
 from bioactivity.models import MeasurementInput, measurement_from_ic50
 
 from ..config import DbConfig, HttpConfig, RunConfig
-from ..db import get_conn
 from ..http import get_json
 from ..models import CompoundInput, Ic50Input, SourceRecordInput, StagedRecord
 from ..normalize import (
@@ -28,7 +31,6 @@ from ..normalize import (
     parse_positive_int,
     parse_positive_float,
 )
-from ..pipeline import run_pipeline
 
 
 CHEMBL_BASE_URL = "https://www.ebi.ac.uk/chembl/api/data"
@@ -339,7 +341,9 @@ def _build_db_config(args: argparse.Namespace) -> DbConfig:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Ingest hERG IC50 data from ChEMBL.")
+    parser = argparse.ArgumentParser(
+        description="Ingest endpoint IC50 data from ChEMBL; defaults to the hERG compatibility endpoint."
+    )
     parser.add_argument("--endpoint-key", default="herg_ic50")
     parser.add_argument("--chembl-base-url", default=CHEMBL_BASE_URL)
     parser.add_argument("--target-chembl-id", default=None)
@@ -365,8 +369,8 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _chembl_source_config_from_args(endpoint: EndpointConfig, args: argparse.Namespace) -> dict[str, object]:
-    source_config = get_source_config(endpoint, ChemblAdapter.source_name)
+def _chembl_source_config_overrides_from_args(args: argparse.Namespace) -> dict[str, object]:
+    source_config: dict[str, object] = {}
     if args.target_chembl_id:
         source_config["target_chembl_id"] = args.target_chembl_id
     if args.standard_type:
@@ -392,28 +396,19 @@ def main() -> int:
     )
     db_config = _build_db_config(args)
 
-    with get_conn(db_config=db_config) as conn:
-        endpoint = load_endpoint(conn, args.endpoint_key)
-
-    adapter = ChemblAdapter.from_source_config(
-        endpoint,
-        _chembl_source_config_from_args(endpoint, args),
+    stats = run_endpoint_ingestion(
+        endpoint_key=args.endpoint_key,
+        source_name=ChemblAdapter.source_name,
+        db_config=db_config,
         http_config=http_config,
-        base_url=args.chembl_base_url,
+        run_config=run_config,
+        source_config_overrides=_chembl_source_config_overrides_from_args(args),
+        chembl_base_url=args.chembl_base_url,
         activity_page_size=args.activity_page_size,
         molecule_batch_size=args.molecule_batch_size,
     )
 
-    stats = run_pipeline(adapter, db_config, run_config, endpoint_key=endpoint.endpoint_key)
-
-    _log("")
-    _log("Ingestion summary")
-    _log("-----------------")
-    _log(f"Source: {adapter.source_name}")
-    _log(f"Processed rows: {stats.processed}")
-    _log(f"Stored rows: {stats.stored}")
-    _log(f"Skipped invalid: {stats.skipped_invalid}")
-    _log(f"Failed inserts: {stats.failed}")
+    print_ingestion_summary(stats, source_name=ChemblAdapter.source_name)
 
     return 1 if stats.failed > 0 else 0
 
