@@ -28,7 +28,7 @@ from herg.normalize import (
     parse_optional_positive_int,
     parse_pipe_or_comma_names,
 )
-from herg.read_db import fetch_compounds, fetch_results, fetch_results_count, resolve_compound_id
+from herg.read_db import fetch_compounds, resolve_compound_id
 
 
 CONCENTRATION_UNIT_TO_UM_FACTOR = {
@@ -390,6 +390,104 @@ def _format_legacy_ic50_results_dataframe(results_df: pd.DataFrame) -> pd.DataFr
     return pd.DataFrame(formatted_rows)
 
 
+def _count_legacy_ic50_results_without_bioactivity(endpoint_id: int) -> int:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM ic50_result_summary_v r
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM bioactivity_results br
+                WHERE br.endpoint_id = %s
+                  AND br.source_record_id = r.source_record_id
+            )
+            """,
+            (endpoint_id,),
+        )
+        row = cur.fetchone()
+    return int(row[0] or 0)
+
+
+def _fetch_legacy_ic50_results_without_bioactivity(endpoint_id: int, limit: int | None) -> pd.DataFrame:
+    query = """
+        SELECT
+            r.result_id,
+            r.compound_id,
+            r.source_record_id,
+            r.endpoint,
+            r.ic50_value,
+            r.ic50_unit,
+            r.qualifier,
+            r.ic50_um,
+            r.pic50,
+            r.pic50_qualifier,
+            r.created_at,
+            r.updated_at,
+            r.source_name,
+            r.source_record_key,
+            r.source_release,
+            r.source_url,
+            r.preferred_name,
+            r.a_number,
+            r.unii,
+            r.pubchem_cid,
+            r.chembl_id,
+            r.standard_inchikey,
+            c.canonical_smiles AS compound_smiles,
+            r.compound_label
+        FROM ic50_result_summary_v r
+        JOIN compound_summary_v c
+          ON c.compound_id = r.compound_id
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM bioactivity_results br
+            WHERE br.endpoint_id = %s
+              AND br.source_record_id = r.source_record_id
+        )
+        ORDER BY r.created_at DESC, r.result_id DESC
+    """
+    params: tuple[Any, ...] = (endpoint_id,)
+    if limit is not None:
+        query += "\nLIMIT %s"
+        params = (endpoint_id, limit)
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        columns = [desc.name for desc in cur.description]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _combine_result_dataframes(
+    bioactivity_df: pd.DataFrame,
+    legacy_df: pd.DataFrame,
+    limit: int | None,
+) -> pd.DataFrame:
+    if bioactivity_df.empty:
+        combined_df = legacy_df.copy()
+    elif legacy_df.empty:
+        combined_df = bioactivity_df.copy()
+    else:
+        combined_df = pd.concat([bioactivity_df, legacy_df], ignore_index=True, sort=False)
+
+    if combined_df.empty:
+        return combined_df
+
+    sorted_df = combined_df.copy()
+    sorted_df["_created_at_sort"] = pd.to_datetime(sorted_df["created_at"], errors="coerce")
+    sorted_df["_result_id_sort"] = pd.to_numeric(sorted_df["result_id"], errors="coerce")
+    sorted_df = sorted_df.sort_values(
+        by=["_created_at_sort", "_result_id_sort"],
+        ascending=[False, False],
+        na_position="last",
+        kind="mergesort",
+    ).drop(columns=["_created_at_sort", "_result_id_sort"])
+    if limit is not None:
+        sorted_df = sorted_df.head(limit)
+    return sorted_df.reset_index(drop=True)
+
+
 def _load_results_for_endpoint(selected_endpoint: EndpointConfig, limit: int | None) -> tuple[int, pd.DataFrame, str]:
     with get_conn() as conn:
         total_results = count_bioactivity_results(conn, selected_endpoint.endpoint_id)
@@ -397,11 +495,18 @@ def _load_results_for_endpoint(selected_endpoint: EndpointConfig, limit: int | N
     results_df = _format_results_dataframe(rows)
 
     # During the migration, existing hERG rows may live only in ic50_results.
-    # Make that fallback explicit instead of silently showing an empty endpoint.
-    if selected_endpoint.endpoint_key == "herg_ic50" and total_results == 0:
-        legacy_total = fetch_results_count()
+    # Keep that compatibility source explicit, and exclude rows already
+    # represented in bioactivity_results to avoid duplicating dual-written rows.
+    if selected_endpoint.endpoint_key == "herg_ic50":
+        legacy_total = _count_legacy_ic50_results_without_bioactivity(selected_endpoint.endpoint_id)
         if legacy_total > 0:
-            return legacy_total, _format_legacy_ic50_results_dataframe(fetch_results(limit)), "legacy ic50_results"
+            legacy_df = _format_legacy_ic50_results_dataframe(
+                _fetch_legacy_ic50_results_without_bioactivity(selected_endpoint.endpoint_id, limit)
+            )
+            combined_df = _combine_result_dataframes(results_df, legacy_df, limit)
+            if total_results > 0:
+                return total_results + legacy_total, combined_df, "bioactivity_results + legacy ic50_results"
+            return legacy_total, combined_df, "legacy ic50_results"
 
     return total_results, results_df, "bioactivity_results"
 

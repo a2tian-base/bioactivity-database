@@ -126,6 +126,33 @@ def _measurement_input_from_staged_record(
     )
 
 
+def _derive_ic50_result_values(cur, measurement) -> dict[str, Any]:
+    cur.execute(
+        """
+        WITH normalized AS (
+            SELECT convert_to_um(%s::numeric, %s::text) AS ic50_um
+        )
+        SELECT
+            ic50_um,
+            ROUND((6 - LOG(10, ic50_um))::NUMERIC, 4) AS pic50,
+            invert_qualifier(%s::char(1)) AS pic50_qualifier
+        FROM normalized
+        """,
+        (
+            measurement.ic50_value,
+            measurement.ic50_unit,
+            measurement.qualifier,
+        ),
+    )
+    row = cur.fetchone()
+    return {
+        "result_id": None,
+        "ic50_um": row[0],
+        "pic50": row[1],
+        "pic50_qualifier": row[2],
+    }
+
+
 def run_pipeline(
     adapter: SourceAdapter,
     db_config: DbConfig,
@@ -146,6 +173,7 @@ def run_pipeline(
 
     def process_rows(rows: list[dict], cur) -> None:
         nonlocal processed_since_commit
+        write_legacy_ic50 = endpoint_key == DEFAULT_ENDPOINT_KEY
         enriched_rows = adapter.enrich_batch(rows)
         if len(enriched_rows) != len(rows):
             stats.warnings += 1
@@ -175,7 +203,10 @@ def run_pipeline(
             try:
                 compound_id = upsert_compound(cur, staged.compound)
                 source_record_id = upsert_source_record(cur, staged.source_record)
-                ic50_result = upsert_ic50_result(cur, compound_id, source_record_id, staged.measurement)
+                if write_legacy_ic50:
+                    ic50_result = upsert_ic50_result(cur, compound_id, source_record_id, staged.measurement)
+                else:
+                    ic50_result = _derive_ic50_result_values(cur, staged.measurement)
                 if endpoint_id is not None:
                     upsert_bioactivity_result(
                         cur,
