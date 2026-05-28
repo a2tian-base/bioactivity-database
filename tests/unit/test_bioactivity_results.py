@@ -70,6 +70,35 @@ def test_format_bioactivity_result_row_handles_categorical_without_p_value():
     assert formatted["value_text"] == "positive"
 
 
+def test_format_bioactivity_result_row_includes_percent_numeric_value():
+    formatted = format_bioactivity_result_row(
+        {
+            "measurement_type": "Inhibition",
+            "value_kind": "percent",
+            "standard_value": Decimal("55.5000"),
+            "standard_unit": "%",
+            "standard_relation": "=",
+            "source_name": "fixture",
+        }
+    )
+
+    assert formatted["measurement"] == "Inhibition = 55.5 %"
+
+
+def test_format_bioactivity_result_row_includes_generic_numeric_value():
+    formatted = format_bioactivity_result_row(
+        {
+            "measurement_type": "Score",
+            "value_kind": "numeric",
+            "original_value": Decimal("12.300"),
+            "original_relation": ">",
+            "source_name": "fixture",
+        }
+    )
+
+    assert formatted["measurement"] == "Score > 12.3"
+
+
 def test_manual_entry_schema_returns_concentration_fields_for_herg_ic50():
     schema = manual_entry_schema(_endpoint_config())
 
