@@ -53,6 +53,7 @@ class IngestionStats:
     started_at: str = ""
     finished_at: str = ""
     duration_seconds: float = 0.0
+    ingestion_run_id: int | None = None
 
 
 def _validate_staged_record(record: StagedRecord) -> None:
@@ -259,6 +260,7 @@ def run_pipeline(
                         source_release=getattr(adapter, "release", None),
                         query_config=_adapter_query_config(adapter),
                     )
+                    stats.ingestion_run_id = ingestion_run_id
 
                 try:
                     for raw_row in adapter.iter_raw_rows():
@@ -321,6 +323,7 @@ def run_pipeline(
             "started_at": stats.started_at,
             "finished_at": stats.finished_at,
             "duration_seconds": stats.duration_seconds,
+            "ingestion_run_id": stats.ingestion_run_id,
         },
     )
 

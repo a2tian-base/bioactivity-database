@@ -67,7 +67,9 @@ docker compose up -d --build
 
 ## Common Workflows
 
-Use the Streamlit UI for manual entry, CSV upload, endpoint-filtered browsing, dashboard views, and CSV export. The upload tab includes CSV templates for compounds and hERG IC50-compatible result rows.
+Use the Streamlit UI for manual entry, CSV upload, endpoint-filtered browsing, source ingestion, dashboard views, and CSV export. The upload tab includes CSV templates for compounds and hERG IC50-compatible result rows.
+
+The `Ingest` tab lets users preview configured ChEMBL or PubChem rows for the selected endpoint, run dry-run ingestion, and run limited write ingestion after explicit confirmation. Keep dry-run and max-record limits enabled for first passes; larger production-scale runs can still use the CLI.
 
 Generic endpoint ingestion is the preferred source ingestion path. Run scripts from the `frontend` container:
 

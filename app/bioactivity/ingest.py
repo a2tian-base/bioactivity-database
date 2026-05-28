@@ -10,56 +10,20 @@ from herg.normalize import clean_text
 from herg.pipeline import IngestionStats, SourceAdapter, run_pipeline
 
 from .endpoints import EndpointConfig, get_source_config, load_endpoint
+from .source_adapters import SUPPORTED_SOURCES, build_source_adapter, normalize_source_name
 
-
-SUPPORTED_SOURCES = frozenset({"chembl", "pubchem"})
 
 AdapterFactory = Callable[[EndpointConfig, dict[str, Any], HttpConfig, dict[str, Any]], SourceAdapter]
 
 
 def _clean_source_name(source_name: str) -> str:
-    clean_source = clean_text(source_name).lower()
-    if clean_source not in SUPPORTED_SOURCES:
-        allowed = ", ".join(sorted(SUPPORTED_SOURCES))
-        raise ValueError(f"Unsupported source '{source_name}'. Allowed: {allowed}.")
-    return clean_source
+    return normalize_source_name(source_name)
 
 
 def _non_null_overrides(overrides: Mapping[str, Any] | None) -> dict[str, Any]:
     if not overrides:
         return {}
     return {key: value for key, value in overrides.items() if value is not None}
-
-
-def _default_adapter_factory(
-    endpoint: EndpointConfig,
-    source_config: dict[str, Any],
-    http_config: HttpConfig,
-    options: dict[str, Any],
-) -> SourceAdapter:
-    source_name = _clean_source_name(str(options["source_name"]))
-    if source_name == "chembl":
-        from herg.sources.chembl import CHEMBL_BASE_URL, ChemblAdapter
-
-        return ChemblAdapter.from_source_config(
-            endpoint,
-            source_config,
-            http_config=http_config,
-            base_url=str(options.get("chembl_base_url") or CHEMBL_BASE_URL),
-            activity_page_size=options.get("activity_page_size"),
-            molecule_batch_size=options.get("molecule_batch_size"),
-        )
-    if source_name == "pubchem":
-        from herg.sources.pubchem import PUBCHEM_BASE_URL, PubChemAdapter
-
-        return PubChemAdapter.from_source_config(
-            endpoint,
-            source_config,
-            http_config=http_config,
-            base_url=str(options.get("pubchem_base_url") or PUBCHEM_BASE_URL),
-            cid_batch_size=options.get("cid_batch_size"),
-        )
-    raise AssertionError(f"Unhandled source '{source_name}'.")
 
 
 def _call_pipeline(
@@ -118,8 +82,20 @@ def run_endpoint_ingestion(
         "cid_batch_size": cid_batch_size,
     }
     factories = dict(adapter_factories or {})
-    factory = factories.get(clean_source, _default_adapter_factory)
-    adapter = factory(endpoint, source_config, resolved_http_config, adapter_options)
+    if clean_source in factories:
+        adapter = factories[clean_source](endpoint, source_config, resolved_http_config, adapter_options)
+    else:
+        adapter = build_source_adapter(
+            endpoint=endpoint,
+            source_name=clean_source,
+            source_config=source_config,
+            http_config=resolved_http_config,
+            chembl_base_url=chembl_base_url,
+            pubchem_base_url=pubchem_base_url,
+            activity_page_size=activity_page_size,
+            molecule_batch_size=molecule_batch_size,
+            cid_batch_size=cid_batch_size,
+        )
 
     return _call_pipeline(
         pipeline_runner,
