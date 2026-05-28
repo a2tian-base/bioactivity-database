@@ -14,7 +14,8 @@ from herg.sources.chembl import CHEMBL_BASE_URL
 
 
 SOURCE_NAME = "chembl"
-COMMON_CONCENTRATION_POTENCY_TYPES = ("IC50", "EC50", "Ki", "Kd")
+# Current ChEMBL ingestion still normalizes through the legacy IC50 path.
+SUPPORTED_DISCOVERY_MEASUREMENT_TYPES = ("IC50",)
 ALLOWED_CONCENTRATION_UNITS = ("pM", "nM", "uM", "mM")
 ALLOWED_RELATIONS = ("=", "<", ">")
 TARGET_SEARCH_ONLY_FIELDS = (
@@ -173,12 +174,12 @@ def fetch_chembl_activity_availability(
 
 def _measurement_types_for_query(query: ParsedEndpointQuery) -> tuple[str, ...]:
     if not query.measurement_types:
-        return COMMON_CONCENTRATION_POTENCY_TYPES
+        return SUPPORTED_DISCOVERY_MEASUREMENT_TYPES
     requested = [clean_text(value) for value in query.measurement_types]
     return tuple(
         measurement_type
         for measurement_type in requested
-        if measurement_type in COMMON_CONCENTRATION_POTENCY_TYPES
+        if measurement_type in SUPPORTED_DISCOVERY_MEASUREMENT_TYPES
     )
 
 

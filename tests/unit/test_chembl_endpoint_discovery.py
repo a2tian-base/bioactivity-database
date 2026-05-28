@@ -231,13 +231,17 @@ def test_human_exact_gene_symbol_match_ranks_above_fuzzy_nonhuman_target(monkeyp
 
 
 def test_zero_count_candidate_is_warned_and_ranked_below_nonzero_candidate(monkeypatch):
+    alternate_egfr_target = _chembl_target_payload(
+        target_chembl_id="CHEMBL999999",
+        pref_name="EGFR reference target",
+        gene_symbols=("EGFR",),
+        accession="P00534",
+    )
     fake_get_json, _calls = _fake_chembl_get_json(
-        [_egfr_target()],
+        [_egfr_target(), alternate_egfr_target],
         {
             ("CHEMBL203", "IC50"): 0,
-            ("CHEMBL203", "EC50"): 25,
-            ("CHEMBL203", "Ki"): 0,
-            ("CHEMBL203", "Kd"): 0,
+            ("CHEMBL999999", "IC50"): 25,
         },
     )
     monkeypatch.setattr("bioactivity.sources.chembl_discovery.get_json", fake_get_json)
@@ -245,18 +249,18 @@ def test_zero_count_candidate_is_warned_and_ranked_below_nonzero_candidate(monke
     query = parse_endpoint_query("EGFR")
     candidates = build_chembl_endpoint_candidates(query, search_chembl_targets(query), limit=4)
 
-    assert candidates[0].source_availability[0].measurement_type == "EC50"
+    assert candidates[0].source_availability[0].measurement_type == "IC50"
     assert candidates[0].source_availability[0].approximate_count == 25
     zero_count_candidate = next(
         candidate
         for candidate in candidates
-        if candidate.source_availability[0].measurement_type == "IC50"
+        if candidate.source_configs["chembl"]["target_chembl_id"] == "CHEMBL203"
     )
     assert zero_count_candidate.source_availability[0].approximate_count == 0
     assert zero_count_candidate.warnings == ("No ChEMBL IC50 activity records found.",)
 
 
-def test_broad_query_availability_cap_prefers_best_ranked_target_first(monkeypatch):
+def test_broad_query_without_measurement_only_checks_ic50(monkeypatch):
     human_complex = _chembl_target_payload(
         target_chembl_id="CHEMBL4523747",
         pref_name="EGFR/PPP1CA",
@@ -273,9 +277,6 @@ def test_broad_query_availability_cap_prefers_best_ranked_target_first(monkeypat
         [human_complex, mouse_single, _egfr_target()],
         {
             ("CHEMBL203", "IC50"): 10,
-            ("CHEMBL203", "EC50"): 8,
-            ("CHEMBL203", "Ki"): 6,
-            ("CHEMBL203", "Kd"): 4,
         },
     )
     monkeypatch.setattr("bioactivity.sources.chembl_discovery.get_json", fake_get_json)
@@ -284,18 +285,21 @@ def test_broad_query_availability_cap_prefers_best_ranked_target_first(monkeypat
     candidates = build_chembl_endpoint_candidates(query, search_chembl_targets(query), limit=4)
 
     activity_calls = [params for url, params in calls if url.endswith("/activity.json")]
-    assert [params["target_chembl_id"] for params in activity_calls] == [
-        "CHEMBL203",
-        "CHEMBL203",
-        "CHEMBL203",
-        "CHEMBL203",
-    ]
-    assert [candidate.source_availability[0].measurement_type for candidate in candidates] == [
-        "IC50",
-        "EC50",
-        "Ki",
-        "Kd",
-    ]
+    assert {params["standard_type"] for params in activity_calls} == {"IC50"}
+    assert activity_calls[0]["target_chembl_id"] == "CHEMBL203"
+    assert {candidate.source_availability[0].measurement_type for candidate in candidates} == {"IC50"}
+    assert candidates[0].source_configs["chembl"]["target_chembl_id"] == "CHEMBL203"
+
+
+def test_requested_non_ic50_measurement_does_not_produce_candidate_or_activity_check(monkeypatch):
+    fake_get_json, calls = _fake_chembl_get_json([_egfr_target()], {("CHEMBL203", "EC50"): 10})
+    monkeypatch.setattr("bioactivity.sources.chembl_discovery.get_json", fake_get_json)
+
+    query = parse_endpoint_query("EGFR EC50")
+    candidates = build_chembl_endpoint_candidates(query, search_chembl_targets(query), limit=4)
+
+    assert candidates == []
+    assert not [params for url, params in calls if url.endswith("/activity.json")]
 
 
 def test_chembl_discovery_tests_do_not_require_live_http(monkeypatch):
