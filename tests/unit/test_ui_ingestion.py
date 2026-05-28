@@ -60,6 +60,7 @@ def test_run_ui_ingestion_loads_endpoint_builds_adapter_and_calls_pipeline(monke
             failed=0,
             warnings=2,
             duration_seconds=1.25,
+            ingestion_run_id=123,
         )
 
     monkeypatch.setattr("bioactivity.ui_ingestion.get_conn", fake_get_conn)
@@ -101,3 +102,4 @@ def test_run_ui_ingestion_loads_endpoint_builds_adapter_and_calls_pipeline(monke
     assert result.skipped_invalid == 1
     assert result.warnings == 2
     assert result.duration_seconds == 1.25
+    assert result.ingestion_run_id == 123
