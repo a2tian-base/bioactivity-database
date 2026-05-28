@@ -326,6 +326,18 @@ def test_pipeline_writes_cyp3a4_fixture_result_to_bioactivity_results():
         cur.execute("SELECT to_regclass('cyp3a4_ic50_results')")
         endpoint_specific_table = cur.fetchone()[0]
 
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM ic50_results
+            WHERE source_record_id IN (
+                SELECT source_record_id FROM source_records WHERE source_name = %s
+            )
+            """,
+            (adapter.source_name,),
+        )
+        legacy_count = cur.fetchone()[0]
+
         assert generic[0] == 1
         assert generic[1] == "cyp3a4_ic50"
         assert generic[2] == "CYP3A4"
@@ -337,6 +349,7 @@ def test_pipeline_writes_cyp3a4_fixture_result_to_bioactivity_results():
         assert generic[8] == "uM"
         assert generic[9] is not None
         assert endpoint_specific_table is None
+        assert legacy_count == 0
 
         _cleanup(cur, adapter.source_name, adapter.source_name)
         conn.commit()
