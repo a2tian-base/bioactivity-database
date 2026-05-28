@@ -684,8 +684,19 @@ def build_histogram_counts(series: pd.Series, bins: int) -> pd.DataFrame:
 
 def histogram_chart_data(histogram_counts: pd.DataFrame) -> pd.DataFrame:
     chart_data = histogram_counts.copy()
-    chart_data["bin_start_label"] = chart_data["bin_start"].map(lambda value: f"{value:.2f}")
-    return chart_data.set_index("bin_start_label")[["count"]].rename_axis("bin_start")
+    for precision in range(2, 13):
+        chart_data["bin_label"] = chart_data.apply(
+            lambda row: f"{row['bin_start']:.{precision}f} to {row['bin_end']:.{precision}f}",
+            axis=1,
+        )
+        if chart_data["bin_label"].is_unique:
+            break
+    else:
+        chart_data["bin_label"] = [
+            f"{row.bin_start:.12g} to {row.bin_end:.12g} ({position})"
+            for position, row in enumerate(chart_data.itertuples(index=False), start=1)
+        ]
+    return chart_data.set_index("bin_label")[["count"]].rename_axis("bin")
 
 
 def render_import_summary(entity: str, summary: dict[str, Any]) -> None:
