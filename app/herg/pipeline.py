@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from typing import Iterable, Protocol
+from typing import Any, Iterable, Protocol
 
+from bioactivity.db import upsert_bioactivity_result
+from bioactivity.endpoints import load_endpoint
+from bioactivity.models import MeasurementInput, measurement_from_ic50
+from bioactivity.runs import finish_ingestion_run, start_ingestion_run
 from .config import DbConfig, RunConfig
 from .db import (
     ensure_measurement_ingest_schema,
@@ -17,6 +22,7 @@ from .pipeline_common import JsonlLogger, duration_seconds, log_jsonl, now_utc_i
 
 
 DEFAULT_ENRICH_BATCH_SIZE = 250
+DEFAULT_ENDPOINT_KEY = "herg_ic50"
 
 
 def log(message: str) -> None:
@@ -76,7 +82,57 @@ def _enrich_batch_size(adapter: SourceAdapter) -> int:
     return int(getattr(adapter, "enrich_batch_size", DEFAULT_ENRICH_BATCH_SIZE))
 
 
-def run_pipeline(adapter: SourceAdapter, db_config: DbConfig, run_config: RunConfig) -> IngestionStats:
+def _adapter_query_config(adapter: SourceAdapter) -> dict[str, Any]:
+    config = getattr(adapter, "effective_config", None)
+    if isinstance(config, Mapping):
+        return dict(config)
+    return {}
+
+
+def _run_counters(stats: IngestionStats) -> dict[str, int]:
+    return {
+        "rows_seen": stats.processed,
+        "rows_inserted": stats.stored,
+        "rows_updated": stats.updated,
+        "rows_skipped": stats.skipped_invalid,
+        "rows_failed": stats.failed,
+    }
+
+
+def _run_status(stats: IngestionStats, *, uncaught_error: bool = False) -> str:
+    if uncaught_error:
+        return "partial" if stats.stored > 0 else "failed"
+    if stats.failed > 0:
+        return "partial" if stats.stored > 0 else "failed"
+    if stats.skipped_invalid > 0:
+        return "partial"
+    return "succeeded"
+
+
+def _measurement_input_from_staged_record(
+    staged: StagedRecord,
+    ic50_result: dict[str, Any],
+    source_name: str,
+) -> MeasurementInput:
+    return measurement_from_ic50(
+        result_key=clean_text(staged.external_key) or clean_text(staged.source_record.source_record_key),
+        ic50_value=staged.measurement.ic50_value,
+        ic50_unit=staged.measurement.ic50_unit,
+        qualifier=staged.measurement.qualifier,
+        ic50_um=ic50_result.get("ic50_um"),
+        pic50=ic50_result.get("pic50"),
+        pic50_qualifier=ic50_result.get("pic50_qualifier"),
+        quality_flags={"source": clean_text(source_name)},
+    )
+
+
+def run_pipeline(
+    adapter: SourceAdapter,
+    db_config: DbConfig,
+    run_config: RunConfig,
+    *,
+    endpoint_key: str = DEFAULT_ENDPOINT_KEY,
+) -> IngestionStats:
     stats = IngestionStats()
     stats.started_at = now_utc_iso()
     error_logger = JsonlLogger(run_config.errors_path)
@@ -85,6 +141,8 @@ def run_pipeline(adapter: SourceAdapter, db_config: DbConfig, run_config: RunCon
     processed_since_commit = 0
     commit_every = max(1, run_config.commit_every)
     buffer: list[dict] = []
+    endpoint_id: int | None = None
+    ingestion_run_id: int | None = None
 
     def process_rows(rows: list[dict], cur) -> None:
         nonlocal processed_since_commit
@@ -117,7 +175,24 @@ def run_pipeline(adapter: SourceAdapter, db_config: DbConfig, run_config: RunCon
             try:
                 compound_id = upsert_compound(cur, staged.compound)
                 source_record_id = upsert_source_record(cur, staged.source_record)
-                upsert_ic50_result(cur, compound_id, source_record_id, staged.measurement)
+                # Migration 012 compatibility strategy: retain legacy ic50_results
+                # dual-write while bioactivity_results is the primary endpoint
+                # result store. Do not change this without an explicit data
+                # migration plan for existing IC50 consumers.
+                ic50_result = upsert_ic50_result(cur, compound_id, source_record_id, staged.measurement)
+                if endpoint_id is not None:
+                    upsert_bioactivity_result(
+                        cur,
+                        endpoint_id=endpoint_id,
+                        compound_id=compound_id,
+                        source_record_id=source_record_id,
+                        ingestion_run_id=ingestion_run_id,
+                        measurement=_measurement_input_from_staged_record(
+                            staged,
+                            ic50_result,
+                            adapter.source_name,
+                        ),
+                    )
                 cur.execute("RELEASE SAVEPOINT ingest_row")
                 stats.stored += 1
                 processed_since_commit += 1
@@ -143,20 +218,61 @@ def run_pipeline(adapter: SourceAdapter, db_config: DbConfig, run_config: RunCon
         ) as conn:
             with conn.cursor() as cur:
                 ensure_measurement_ingest_schema(cur)
-                for raw_row in adapter.iter_raw_rows():
-                    if run_config.max_records is not None and stats.processed >= run_config.max_records:
-                        break
-                    stats.processed += 1
-                    buffer.append(raw_row)
-                    if len(buffer) >= enrich_batch_size:
+                if not run_config.dry_run:
+                    endpoint = load_endpoint(cur, endpoint_key)
+                    endpoint_id = endpoint.endpoint_id
+                    ingestion_run_id = start_ingestion_run(
+                        cur,
+                        endpoint_id=endpoint.endpoint_id,
+                        source_name=adapter.source_name,
+                        source_release=getattr(adapter, "release", None),
+                        query_config=_adapter_query_config(adapter),
+                    )
+
+                try:
+                    for raw_row in adapter.iter_raw_rows():
+                        if run_config.max_records is not None and stats.processed >= run_config.max_records:
+                            break
+                        stats.processed += 1
+                        buffer.append(raw_row)
+                        if len(buffer) >= enrich_batch_size:
+                            process_rows(buffer, cur)
+                            buffer = []
+
+                    if buffer:
                         process_rows(buffer, cur)
-                        buffer = []
 
-                if buffer:
-                    process_rows(buffer, cur)
+                    if not run_config.dry_run and ingestion_run_id is not None:
+                        finish_ingestion_run(
+                            cur,
+                            ingestion_run_id=ingestion_run_id,
+                            status=_run_status(stats),
+                            counters=_run_counters(stats),
+                            qc_summary={"warnings": stats.warnings},
+                            error_summary={
+                                "skipped_invalid": stats.skipped_invalid,
+                                "failed": stats.failed,
+                            },
+                        )
 
-                if not run_config.dry_run and processed_since_commit > 0:
-                    conn.commit()
+                    if not run_config.dry_run and (processed_since_commit > 0 or ingestion_run_id is not None):
+                        conn.commit()
+                except Exception:
+                    if not run_config.dry_run and ingestion_run_id is not None:
+                        stats.failed += 1
+                        finish_ingestion_run(
+                            cur,
+                            ingestion_run_id=ingestion_run_id,
+                            status=_run_status(stats, uncaught_error=True),
+                            counters=_run_counters(stats),
+                            qc_summary={"warnings": stats.warnings},
+                            error_summary={
+                                "skipped_invalid": stats.skipped_invalid,
+                                "failed": stats.failed,
+                            },
+                        )
+                        conn.commit()
+                    raise
     finally:
         error_logger.close()
 

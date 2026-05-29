@@ -1,0 +1,10 @@
+{
+  "AID": "3401",
+  "SID": "3402",
+  "CID": "3403",
+  "Target GeneID": "1576",
+  "Activity Name": "IC50",
+  "Activity Value [uM]": "0.12",
+  "Activity Outcome": "Active",
+  "Assay Name": "CYP3A4 Fixture Assay"
+}

@@ -368,6 +368,74 @@ DO UPDATE SET
     spec_hash = EXCLUDED.spec_hash,
     active = EXCLUDED.active;
 
+WITH cyp3a4_ic50_endpoint AS (
+    SELECT
+        'cyp3a4_ic50'::TEXT AS endpoint_key,
+        'CYP3A4 IC50'::TEXT AS display_name,
+        '{
+          "target": {
+            "preferred_name": "Cytochrome P450 3A4",
+            "gene_symbol": "CYP3A4",
+            "organism": "Homo sapiens",
+            "identifiers": {
+              "chembl_target_id": "CHEMBL340",
+              "ncbi_gene_id": "1576"
+            }
+          },
+          "measurement": {
+            "type": "IC50",
+            "value_kind": "concentration",
+            "canonical_unit": "uM",
+            "supports_p_value": true,
+            "p_value_name": "pIC50"
+          },
+          "normalization": {
+            "allowed_units": ["pM", "nM", "uM", "mM"],
+            "allowed_relations": ["=", "<", ">"]
+          },
+          "inclusion_criteria": {
+            "organism": "Homo sapiens",
+            "direct_target_only": true
+          }
+        }'::JSONB AS spec,
+        '{
+          "chembl": {
+            "target_chembl_id": "CHEMBL340",
+            "standard_type": "IC50",
+            "standard_relation__in": ["=", "<", ">"],
+            "data_validity_comment__isnull": true
+          },
+          "pubchem": {
+            "target_gene_symbol": "CYP3A4",
+            "target_gene_id": "1576",
+            "activity_name_regex": "(?i)\\bIC50\\b"
+          }
+        }'::JSONB AS source_configs
+)
+INSERT INTO endpoints (
+    endpoint_key,
+    display_name,
+    spec,
+    source_configs,
+    spec_hash,
+    active
+)
+SELECT
+    endpoint_key,
+    display_name,
+    spec,
+    source_configs,
+    md5(spec::TEXT || '|' || source_configs::TEXT),
+    TRUE
+FROM cyp3a4_ic50_endpoint
+ON CONFLICT (endpoint_key)
+DO UPDATE SET
+    display_name = EXCLUDED.display_name,
+    spec = EXCLUDED.spec,
+    source_configs = EXCLUDED.source_configs,
+    spec_hash = EXCLUDED.spec_hash,
+    active = EXCLUDED.active;
+
 CREATE TRIGGER trg_set_compounds_updated_at
 BEFORE UPDATE
 ON compounds
@@ -755,6 +823,107 @@ BEGIN
         ic50_unit = EXCLUDED.ic50_unit,
         qualifier = EXCLUDED.qualifier
     RETURNING ic50_results.result_id, ic50_results.ic50_um, ic50_results.pic50, ic50_results.pic50_qualifier;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION upsert_bioactivity_result(
+    p_endpoint_id BIGINT,
+    p_compound_id BIGINT,
+    p_source_record_id BIGINT,
+    p_ingestion_run_id BIGINT DEFAULT NULL,
+    p_result_key TEXT DEFAULT NULL,
+    p_measurement_type TEXT DEFAULT NULL,
+    p_value_kind TEXT DEFAULT NULL,
+    p_original_value NUMERIC DEFAULT NULL,
+    p_original_unit TEXT DEFAULT NULL,
+    p_original_relation TEXT DEFAULT NULL,
+    p_standard_value NUMERIC DEFAULT NULL,
+    p_standard_unit TEXT DEFAULT NULL,
+    p_standard_relation TEXT DEFAULT NULL,
+    p_p_value NUMERIC DEFAULT NULL,
+    p_p_value_relation TEXT DEFAULT NULL,
+    p_value_text TEXT DEFAULT NULL,
+    p_assay_context JSONB DEFAULT '{}'::JSONB,
+    p_quality_flags JSONB DEFAULT '{}'::JSONB
+) RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_result_key TEXT := NULLIF(BTRIM(p_result_key), '');
+    v_measurement_type TEXT := NULLIF(BTRIM(p_measurement_type), '');
+    v_value_kind TEXT := NULLIF(BTRIM(p_value_kind), '');
+    v_assay_context JSONB := COALESCE(p_assay_context, '{}'::JSONB);
+    v_quality_flags JSONB := COALESCE(p_quality_flags, '{}'::JSONB);
+    v_result_id BIGINT;
+BEGIN
+    IF v_result_key IS NULL THEN
+        RAISE EXCEPTION 'result_key is required.';
+    END IF;
+
+    IF v_measurement_type IS NULL THEN
+        RAISE EXCEPTION 'measurement_type is required.';
+    END IF;
+
+    INSERT INTO bioactivity_results (
+        endpoint_id,
+        compound_id,
+        source_record_id,
+        ingestion_run_id,
+        result_key,
+        measurement_type,
+        value_kind,
+        original_value,
+        original_unit,
+        original_relation,
+        standard_value,
+        standard_unit,
+        standard_relation,
+        p_value,
+        p_value_relation,
+        value_text,
+        assay_context,
+        quality_flags
+    )
+    VALUES (
+        p_endpoint_id,
+        p_compound_id,
+        p_source_record_id,
+        p_ingestion_run_id,
+        v_result_key,
+        v_measurement_type,
+        v_value_kind,
+        p_original_value,
+        NULLIF(BTRIM(p_original_unit), ''),
+        NULLIF(BTRIM(p_original_relation), ''),
+        p_standard_value,
+        NULLIF(BTRIM(p_standard_unit), ''),
+        NULLIF(BTRIM(p_standard_relation), ''),
+        p_p_value,
+        NULLIF(BTRIM(p_p_value_relation), ''),
+        NULLIF(BTRIM(p_value_text), ''),
+        v_assay_context,
+        v_quality_flags
+    )
+    ON CONFLICT (endpoint_id, source_record_id, result_key)
+    DO UPDATE SET
+        compound_id = EXCLUDED.compound_id,
+        ingestion_run_id = EXCLUDED.ingestion_run_id,
+        measurement_type = EXCLUDED.measurement_type,
+        value_kind = EXCLUDED.value_kind,
+        original_value = EXCLUDED.original_value,
+        original_unit = EXCLUDED.original_unit,
+        original_relation = EXCLUDED.original_relation,
+        standard_value = EXCLUDED.standard_value,
+        standard_unit = EXCLUDED.standard_unit,
+        standard_relation = EXCLUDED.standard_relation,
+        p_value = EXCLUDED.p_value,
+        p_value_relation = EXCLUDED.p_value_relation,
+        value_text = EXCLUDED.value_text,
+        assay_context = EXCLUDED.assay_context,
+        quality_flags = EXCLUDED.quality_flags
+    RETURNING bioactivity_results.result_id INTO v_result_id;
+
+    RETURN v_result_id;
 END;
 $$;
 

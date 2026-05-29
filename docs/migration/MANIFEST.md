@@ -14,3 +14,4 @@
 - `010_streamlit_endpoint_ui.md`
 - `011_second_endpoint_smoke_test.md`
 - `012_deprecation_cleanup.md`
+- `013_ui_ingestion_migration_plan.md`

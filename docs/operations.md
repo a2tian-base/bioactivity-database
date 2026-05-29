@@ -28,7 +28,47 @@ Notes:
 
 Run scripts inside the `frontend` container so they use the same dependencies and network as the app.
 
-ChEMBL hERG IC50 ingestion:
+### UI ingestion
+
+The Streamlit `Ingest` tab uses the currently selected endpoint and lists sources configured in `endpoints.source_configs`.
+
+Recommended workflow:
+
+```text
+1. Select an endpoint.
+2. Open Ingest.
+3. Select chembl or pubchem.
+4. Preview source rows.
+5. Run dry-run ingestion with a max-record limit.
+6. Disable dry-run only after reviewing the preview and dry-run counters.
+7. Confirm write ingestion explicitly before running.
+```
+
+Dry-run is enabled by default, max records defaults to 100, and write ingestion requires the confirmation checkbox. Completed write ingestion records can be inspected in `ingestion_runs`, `bioactivity_results`, and the endpoint-aware Browse Results tab.
+
+### CLI ingestion
+
+Generic endpoint ingestion is the preferred path. Endpoint-specific settings come from the `endpoints.source_configs` JSON, and CLI source flags act as explicit overrides.
+
+ChEMBL endpoint ingestion:
+
+```powershell
+docker compose exec frontend python /app/scripts/ingest_endpoint.py --endpoint-key herg_ic50 --source chembl --dry-run --max-records 100
+docker compose exec frontend python /app/scripts/ingest_endpoint.py --endpoint-key cyp3a4_ic50 --source chembl --dry-run --max-records 100
+docker compose exec frontend python /app/scripts/ingest_endpoint.py --endpoint-key herg_ic50 --source chembl
+```
+
+PubChem endpoint ingestion:
+
+```powershell
+docker compose exec frontend python /app/scripts/ingest_endpoint.py --endpoint-key herg_ic50 --source pubchem --dry-run --max-records 100
+docker compose exec frontend python /app/scripts/ingest_endpoint.py --endpoint-key cyp3a4_ic50 --source pubchem --dry-run --max-records 100
+docker compose exec frontend python /app/scripts/ingest_endpoint.py --endpoint-key herg_ic50 --source pubchem
+```
+
+The old hERG script names remain callable as compatibility wrappers around generic endpoint ingestion with `--endpoint-key herg_ic50` as the default.
+
+ChEMBL hERG compatibility wrapper:
 
 ```powershell
 docker compose exec frontend python /app/scripts/ingest_chembl_herg.py --dry-run --max-records 100
@@ -48,7 +88,7 @@ Useful ChEMBL flags:
 --stats-path /tmp/chembl-stats.json
 ```
 
-PubChem hERG IC50 ingestion:
+PubChem hERG compatibility wrapper:
 
 ```powershell
 docker compose exec frontend python /app/scripts/ingest_pubchem_herg.py --dry-run --max-records 100
@@ -66,6 +106,10 @@ Useful PubChem flags:
 --errors-path /tmp/pubchem-errors.jsonl
 --stats-path /tmp/pubchem-stats.json
 ```
+
+### IC50 compatibility strategy
+
+`bioactivity_results` is the primary endpoint result table. The legacy `ic50_results` table and `ic50_result_summary_v` view are retained for existing hERG IC50 consumers. IC50 ingestion paths intentionally dual-write to both `ic50_results` and `bioactivity_results`; tests assert that the duplicated values stay consistent.
 
 ## Identifier Enrichment
 
@@ -130,7 +174,25 @@ Useful flags:
 
 ```sql
 SELECT COUNT(*) AS compounds_n FROM compound_summary_v;
-SELECT COUNT(*) AS results_n FROM ic50_result_summary_v;
+SELECT COUNT(*) AS endpoint_results_n FROM bioactivity_results;
+SELECT COUNT(*) AS legacy_ic50_results_n FROM ic50_result_summary_v;
+
+SELECT
+  e.endpoint_key,
+  b.result_id,
+  b.compound_id,
+  b.measurement_type,
+  b.value_kind,
+  b.standard_value,
+  b.standard_unit,
+  b.p_value,
+  s.source_name,
+  s.source_record_key
+FROM bioactivity_results b
+JOIN endpoints e ON e.endpoint_id = b.endpoint_id
+JOIN source_records s ON s.source_record_id = b.source_record_id
+ORDER BY b.result_id DESC
+LIMIT 20;
 
 SELECT
   result_id,

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-PubChem source adapter for hERG IC50 ingestion.
+PubChem source adapter for endpoint-driven IC50 ingestion.
+
+The hERG script entry point is retained as a compatibility wrapper and uses
+``herg_ic50`` as its default endpoint.
 """
 
 from __future__ import annotations
@@ -8,8 +11,12 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from typing import Dict, Iterable, List, Sequence
+from collections.abc import Mapping
+from typing import Any, Dict, Iterable, List, Pattern, Sequence
 
+from bioactivity.endpoints import EndpointConfig
+from bioactivity.ingest import print_ingestion_summary, run_endpoint_ingestion
+from bioactivity.models import MeasurementInput, measurement_from_ic50
 from ..config import DbConfig, HttpConfig, RunConfig
 from ..http import get_csv_rows, get_json
 from ..models import CompoundInput, Ic50Input, SourceRecordInput, StagedRecord
@@ -21,11 +28,11 @@ from ..normalize import (
     parse_positive_float,
     parse_positive_int,
 )
-from ..pipeline import run_pipeline
 
 
 PUBCHEM_BASE_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
 DEFAULT_CONCISE_PATH = "/assay/target/genesymbol/{gene_symbol}/concise/CSV"
+DEFAULT_CID_BATCH_SIZE = 150
 
 
 def _chunked(values: Sequence[int], size: int) -> Iterable[Sequence[int]]:
@@ -35,6 +42,47 @@ def _chunked(values: Sequence[int], size: int) -> Iterable[Sequence[int]]:
 
 def _log(message: str) -> None:
     print(message, flush=True)
+
+
+def _required_config_text(source_config: Mapping[str, Any], key: str) -> str:
+    value = clean_text(source_config.get(key))
+    if not value:
+        raise ValueError(f"PubChem source config requires '{key}'.")
+    return value
+
+
+def _compile_activity_name_regex(value: str) -> Pattern[str]:
+    try:
+        return re.compile(value)
+    except re.error as exc:
+        raise ValueError(f"Invalid PubChem activity_name_regex '{value}'.") from exc
+
+
+def _optional_positive_int(value: object, default: int) -> int:
+    if value is None:
+        return default
+    return parse_positive_int(value)
+
+
+def _normalize_pubchem_source_config(
+    source_config: Mapping[str, Any],
+    *,
+    cid_batch_size: int | None = None,
+) -> dict[str, object]:
+    if not isinstance(source_config, Mapping):
+        raise ValueError("PubChem source config must be a mapping.")
+
+    activity_name_regex = _required_config_text(source_config, "activity_name_regex")
+    _compile_activity_name_regex(activity_name_regex)
+
+    return {
+        "target_gene_symbol": _required_config_text(source_config, "target_gene_symbol"),
+        "target_gene_id": _required_config_text(source_config, "target_gene_id"),
+        "activity_name_regex": activity_name_regex,
+        "cid_batch_size": cid_batch_size
+        if cid_batch_size is not None
+        else _optional_positive_int(source_config.get("cid_batch_size"), DEFAULT_CID_BATCH_SIZE),
+    }
 
 
 class PubChemAdapter:
@@ -53,9 +101,39 @@ class PubChemAdapter:
         self.base_url = base_url.rstrip("/")
         self.target_gene_symbol = target_gene_symbol
         self.target_gene_id = target_gene_id
-        self.activity_name_pattern = re.compile(activity_name_regex)
+        self.activity_name_regex = activity_name_regex
+        self.activity_name_pattern = _compile_activity_name_regex(activity_name_regex)
         self.cid_batch_size = cid_batch_size
         self.enrich_batch_size = max(1, cid_batch_size)
+
+    @classmethod
+    def from_source_config(
+        cls,
+        endpoint: EndpointConfig,
+        source_config: Mapping[str, Any],
+        *,
+        http_config: HttpConfig,
+        base_url: str = PUBCHEM_BASE_URL,
+        cid_batch_size: int | None = None,
+    ) -> "PubChemAdapter":
+        config = _normalize_pubchem_source_config(source_config, cid_batch_size=cid_batch_size)
+        return cls(
+            http_config=http_config,
+            base_url=base_url,
+            target_gene_symbol=str(config["target_gene_symbol"]),
+            target_gene_id=str(config["target_gene_id"]),
+            activity_name_regex=str(config["activity_name_regex"]),
+            cid_batch_size=int(config["cid_batch_size"]),
+        )
+
+    @property
+    def effective_config(self) -> dict[str, object]:
+        return {
+            "target_gene_symbol": self.target_gene_symbol,
+            "target_gene_id": self.target_gene_id,
+            "activity_name_regex": self.activity_name_regex,
+            "cid_batch_size": self.cid_batch_size,
+        }
 
     def iter_raw_rows(self) -> Iterable[dict]:
         concise_url = self.base_url + DEFAULT_CONCISE_PATH.format(gene_symbol=self.target_gene_symbol)
@@ -193,6 +271,27 @@ class PubChemAdapter:
         )
 
 
+def measurement_input_from_pubchem_record(record: StagedRecord) -> MeasurementInput:
+    concise_row = record.source_record.raw_payload.get("concise_row") or {}
+    assay_context = {
+        "aid": clean_text(concise_row.get("AID")),
+        "sid": clean_text(concise_row.get("SID")),
+        "cid": clean_text(concise_row.get("CID")),
+        "activity_name": clean_text(concise_row.get("Activity Name")),
+        "activity_outcome": clean_text(concise_row.get("Activity Outcome")),
+        "assay_name": clean_text(concise_row.get("Assay Name")),
+    }
+    assay_context = {key: value for key, value in assay_context.items() if value}
+    return measurement_from_ic50(
+        result_key=record.external_key,
+        ic50_value=record.measurement.ic50_value,
+        ic50_unit=record.measurement.ic50_unit,
+        qualifier=record.measurement.qualifier,
+        assay_context=assay_context,
+        quality_flags={"source": PubChemAdapter.source_name},
+    )
+
+
 def _build_db_config(args: argparse.Namespace) -> DbConfig:
     config = DbConfig.from_env()
     return DbConfig(
@@ -205,11 +304,14 @@ def _build_db_config(args: argparse.Namespace) -> DbConfig:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Ingest hERG IC50 data from PubChem.")
+    parser = argparse.ArgumentParser(
+        description="Ingest endpoint IC50 data from PubChem; defaults to the hERG compatibility endpoint."
+    )
+    parser.add_argument("--endpoint-key", default="herg_ic50")
     parser.add_argument("--pubchem-base-url", default=PUBCHEM_BASE_URL)
-    parser.add_argument("--target-gene-symbol", default="KCNH2")
-    parser.add_argument("--target-gene-id", default="3757")
-    parser.add_argument("--activity-name-regex", default=r"(?i)\bic50\b")
+    parser.add_argument("--target-gene-symbol", default=None)
+    parser.add_argument("--target-gene-id", default=None)
+    parser.add_argument("--activity-name-regex", default=None)
     parser.add_argument("--cid-batch-size", type=int, default=150)
 
     parser.add_argument("--dry-run", action="store_true")
@@ -229,6 +331,17 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _pubchem_source_config_overrides_from_args(args: argparse.Namespace) -> dict[str, object]:
+    source_config: dict[str, object] = {}
+    if args.target_gene_symbol:
+        source_config["target_gene_symbol"] = args.target_gene_symbol
+    if args.target_gene_id:
+        source_config["target_gene_id"] = args.target_gene_id
+    if args.activity_name_regex:
+        source_config["activity_name_regex"] = args.activity_name_regex
+    return source_config
+
+
 def main() -> int:
     args = _parse_args()
     http_config = HttpConfig(
@@ -245,25 +358,18 @@ def main() -> int:
     )
     db_config = _build_db_config(args)
 
-    adapter = PubChemAdapter(
+    stats = run_endpoint_ingestion(
+        endpoint_key=args.endpoint_key,
+        source_name=PubChemAdapter.source_name,
+        db_config=db_config,
         http_config=http_config,
-        base_url=args.pubchem_base_url,
-        target_gene_symbol=args.target_gene_symbol,
-        target_gene_id=args.target_gene_id,
-        activity_name_regex=args.activity_name_regex,
+        run_config=run_config,
+        source_config_overrides=_pubchem_source_config_overrides_from_args(args),
+        pubchem_base_url=args.pubchem_base_url,
         cid_batch_size=args.cid_batch_size,
     )
 
-    stats = run_pipeline(adapter, db_config, run_config)
-
-    _log("")
-    _log("Ingestion summary")
-    _log("-----------------")
-    _log(f"Source: {adapter.source_name}")
-    _log(f"Processed rows: {stats.processed}")
-    _log(f"Stored rows: {stats.stored}")
-    _log(f"Skipped invalid: {stats.skipped_invalid}")
-    _log(f"Failed inserts: {stats.failed}")
+    print_ingestion_summary(stats, source_name=PubChemAdapter.source_name)
 
     return 1 if stats.failed > 0 else 0
 
