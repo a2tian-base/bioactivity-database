@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 import urllib.error
 import uuid
+from decimal import Decimal
 from typing import Any
 
 import pandas as pd
@@ -41,6 +42,14 @@ from herg.normalize import (
     parse_pipe_or_comma_names,
 )
 from herg.read_db import fetch_compounds, resolve_compound_id
+
+
+CONCENTRATION_UNIT_TO_UM_FACTOR = {
+    "pM": Decimal("0.000001"),
+    "nM": Decimal("0.001"),
+    "uM": Decimal("1"),
+    "mM": Decimal("1000"),
+}
 
 DEFAULT_INGESTION_PREVIEW_LIMIT = 20
 DEFAULT_INGESTION_MAX_RECORDS = 100
@@ -673,6 +682,23 @@ def build_histogram_counts(series: pd.Series, bins: int) -> pd.DataFrame:
     )
 
 
+def histogram_chart_data(histogram_counts: pd.DataFrame) -> pd.DataFrame:
+    chart_data = histogram_counts.copy()
+    for precision in range(2, 13):
+        chart_data["bin_label"] = chart_data.apply(
+            lambda row: f"{row['bin_start']:.{precision}f} to {row['bin_end']:.{precision}f}",
+            axis=1,
+        )
+        if chart_data["bin_label"].is_unique:
+            break
+    else:
+        chart_data["bin_label"] = [
+            f"{row.bin_start:.12g} to {row.bin_end:.12g} ({position})"
+            for position, row in enumerate(chart_data.itertuples(index=False), start=1)
+        ]
+    return chart_data.set_index("bin_label")[["count"]].rename_axis("bin")
+
+
 def render_import_summary(entity: str, summary: dict[str, Any]) -> None:
     st.info(
         f"{entity}: imported {summary['imported']} of {summary['total']} rows "
@@ -686,6 +712,184 @@ def render_import_summary(entity: str, summary: dict[str, Any]) -> None:
 def _format_results_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
     formatted_rows = [format_bioactivity_result_row(row) for row in rows]
     return pd.DataFrame(formatted_rows)
+
+
+def _format_legacy_ic50_results_dataframe(results_df: pd.DataFrame) -> pd.DataFrame:
+    formatted_rows: list[dict[str, Any]] = []
+    for row in results_df.to_dict(orient="records"):
+        standard_value = row.get("ic50_um")
+        standard_relation = row.get("qualifier") if standard_value is not None else None
+        formatted_rows.append(
+            {
+                "result_id": row.get("result_id"),
+                "compound_id": row.get("compound_id"),
+                "compound": row.get("compound_label") or row.get("compound_id"),
+                "source": row.get("source_name"),
+                "source_record_key": row.get("source_record_key"),
+                "measurement_type": "IC50",
+                "value_kind": "concentration",
+                "measurement": format_bioactivity_result_row(
+                    {
+                        "measurement_type": "IC50",
+                        "value_kind": "concentration",
+                        "standard_value": standard_value,
+                        "standard_unit": "uM" if standard_value is not None else None,
+                        "standard_relation": standard_relation,
+                        "original_value": row.get("ic50_value"),
+                        "original_unit": row.get("ic50_unit"),
+                        "original_relation": row.get("qualifier"),
+                    }
+                )["measurement"],
+                "original_value": row.get("ic50_value"),
+                "original_unit": row.get("ic50_unit"),
+                "original_relation": row.get("qualifier"),
+                "standard_value": standard_value,
+                "standard_unit": "uM" if standard_value is not None else "",
+                "standard_relation": standard_relation or "",
+                "p_value": row.get("pic50"),
+                "p_value_relation": row.get("pic50_qualifier"),
+                "p_value_display": format_bioactivity_result_row(
+                    {
+                        "measurement_type": "IC50",
+                        "value_kind": "concentration",
+                        "p_value": row.get("pic50"),
+                        "p_value_relation": row.get("pic50_qualifier"),
+                    }
+                )["p_value_display"],
+                "value_text": "",
+                "assay_context": "",
+                "quality_flags": "",
+                "endpoint_id": None,
+                "endpoint_key": "herg_ic50",
+                "endpoint": "hERG IC50",
+                "source_record_id": row.get("source_record_id"),
+                "ingestion_run_id": None,
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+            }
+        )
+    return pd.DataFrame(formatted_rows)
+
+
+def _count_legacy_ic50_results_without_bioactivity(endpoint_id: int) -> int:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM ic50_result_summary_v r
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM bioactivity_results br
+                WHERE br.endpoint_id = %s
+                  AND br.source_record_id = r.source_record_id
+            )
+            """,
+            (endpoint_id,),
+        )
+        row = cur.fetchone()
+    return int(row[0] or 0)
+
+
+def _fetch_legacy_ic50_results_without_bioactivity(endpoint_id: int, limit: int | None) -> pd.DataFrame:
+    query = """
+        SELECT
+            r.result_id,
+            r.compound_id,
+            r.source_record_id,
+            r.endpoint,
+            r.ic50_value,
+            r.ic50_unit,
+            r.qualifier,
+            r.ic50_um,
+            r.pic50,
+            r.pic50_qualifier,
+            r.created_at,
+            r.updated_at,
+            r.source_name,
+            r.source_record_key,
+            r.source_release,
+            r.source_url,
+            r.preferred_name,
+            r.a_number,
+            r.unii,
+            r.pubchem_cid,
+            r.chembl_id,
+            r.standard_inchikey,
+            c.canonical_smiles AS compound_smiles,
+            r.compound_label
+        FROM ic50_result_summary_v r
+        JOIN compound_summary_v c
+          ON c.compound_id = r.compound_id
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM bioactivity_results br
+            WHERE br.endpoint_id = %s
+              AND br.source_record_id = r.source_record_id
+        )
+        ORDER BY r.created_at DESC, r.result_id DESC
+    """
+    params: tuple[Any, ...] = (endpoint_id,)
+    if limit is not None:
+        query += "\nLIMIT %s"
+        params = (endpoint_id, limit)
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        columns = [desc.name for desc in cur.description]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _combine_result_dataframes(
+    bioactivity_df: pd.DataFrame,
+    legacy_df: pd.DataFrame,
+    limit: int | None,
+) -> pd.DataFrame:
+    if bioactivity_df.empty:
+        combined_df = legacy_df.copy()
+    elif legacy_df.empty:
+        combined_df = bioactivity_df.copy()
+    else:
+        combined_df = pd.concat([bioactivity_df, legacy_df], ignore_index=True, sort=False)
+
+    if combined_df.empty:
+        return combined_df
+
+    sorted_df = combined_df.copy()
+    sorted_df["_created_at_sort"] = pd.to_datetime(sorted_df["created_at"], errors="coerce")
+    sorted_df["_result_id_sort"] = pd.to_numeric(sorted_df["result_id"], errors="coerce")
+    sorted_df = sorted_df.sort_values(
+        by=["_created_at_sort", "_result_id_sort"],
+        ascending=[False, False],
+        na_position="last",
+        kind="mergesort",
+    ).drop(columns=["_created_at_sort", "_result_id_sort"])
+    if limit is not None:
+        sorted_df = sorted_df.head(limit)
+    return sorted_df.reset_index(drop=True)
+
+
+def _load_results_for_endpoint(selected_endpoint: EndpointConfig, limit: int | None) -> tuple[int, pd.DataFrame, str]:
+    with get_conn() as conn:
+        total_results = count_bioactivity_results(conn, selected_endpoint.endpoint_id)
+        rows = fetch_bioactivity_results(conn, endpoint_id=selected_endpoint.endpoint_id, limit=limit)
+    results_df = _format_results_dataframe(rows)
+
+    # During the migration, existing hERG rows may live only in ic50_results.
+    # Keep that compatibility source explicit, and exclude rows already
+    # represented in bioactivity_results to avoid duplicating dual-written rows.
+    if selected_endpoint.endpoint_key == "herg_ic50":
+        legacy_total = _count_legacy_ic50_results_without_bioactivity(selected_endpoint.endpoint_id)
+        if legacy_total > 0:
+            legacy_df = _format_legacy_ic50_results_dataframe(
+                _fetch_legacy_ic50_results_without_bioactivity(selected_endpoint.endpoint_id, limit)
+            )
+            combined_df = _combine_result_dataframes(results_df, legacy_df, limit)
+            if total_results > 0:
+                return total_results + legacy_total, combined_df, "bioactivity_results + legacy ic50_results"
+            return legacy_total, combined_df, "legacy ic50_results"
+
+    return total_results, results_df, "bioactivity_results"
 
 
 def _preview_examples_dataframe(examples: list[PreviewExample]) -> pd.DataFrame:
@@ -815,6 +1019,37 @@ def _source_record_from_form(
     )
 
 
+def _normalize_concentration_unit(unit: str) -> str:
+    raw = clean_text(unit).replace("\u00b5", "u").replace("\u03bc", "u").replace(" ", "")
+    mapping = {
+        "pm": "pM",
+        "nm": "nM",
+        "um": "uM",
+        "mm": "mM",
+    }
+    return mapping.get(raw.lower(), raw)
+
+
+def _standardize_concentration_value(value: float, unit: str, canonical_unit: str | None) -> Decimal | None:
+    if not canonical_unit:
+        return None
+
+    normalized_unit = _normalize_concentration_unit(unit)
+    normalized_canonical_unit = _normalize_concentration_unit(canonical_unit)
+    value_decimal = Decimal(str(value))
+    if normalized_unit == normalized_canonical_unit:
+        return value_decimal
+
+    if normalized_unit in CONCENTRATION_UNIT_TO_UM_FACTOR and normalized_canonical_unit in CONCENTRATION_UNIT_TO_UM_FACTOR:
+        value_um = value_decimal * CONCENTRATION_UNIT_TO_UM_FACTOR[normalized_unit]
+        return value_um / CONCENTRATION_UNIT_TO_UM_FACTOR[normalized_canonical_unit]
+
+    raise ValueError(
+        f"Cannot normalize concentration unit '{unit}' to canonical unit '{canonical_unit}'. "
+        f"Enter values in {canonical_unit} for this endpoint."
+    )
+
+
 def _measurement_from_concentration_form(
     *,
     source_record_key: str,
@@ -824,17 +1059,19 @@ def _measurement_from_concentration_form(
     relation: str,
     canonical_unit: str | None,
 ) -> MeasurementInput:
-    same_unit_as_canonical = bool(canonical_unit and unit == canonical_unit)
+    normalized_unit = _normalize_concentration_unit(unit)
+    normalized_canonical_unit = _normalize_concentration_unit(canonical_unit) if canonical_unit else None
+    standard_value = _standardize_concentration_value(value, normalized_unit, normalized_canonical_unit)
     return MeasurementInput(
         result_key=source_record_key,
         measurement_type=measurement_type,
         value_kind="concentration",
         original_value=value,
-        original_unit=unit,
+        original_unit=normalized_unit,
         original_relation=relation,
-        standard_value=value if same_unit_as_canonical else None,
-        standard_unit=canonical_unit if same_unit_as_canonical else None,
-        standard_relation=relation if same_unit_as_canonical else None,
+        standard_value=standard_value,
+        standard_unit=normalized_canonical_unit if standard_value is not None else None,
+        standard_relation=relation if standard_value is not None else None,
         assay_context={"entry_path": "streamlit_manual_entry"},
         quality_flags={"entry_path": "streamlit_manual_entry"},
     )
@@ -1184,15 +1421,12 @@ def render_browse_tab(selected_endpoint: EndpointConfig) -> None:
     limit = st.slider("Rows to preview", min_value=10, max_value=1000, value=100, step=10)
 
     try:
-        with get_conn() as conn:
-            total_results = count_bioactivity_results(conn, selected_endpoint.endpoint_id)
-            rows = fetch_bioactivity_results(conn, endpoint_id=selected_endpoint.endpoint_id, limit=limit)
-        results_df = _format_results_dataframe(rows)
+        total_results, results_df, data_source = _load_results_for_endpoint(selected_endpoint, limit)
         if total_results == 0 or results_df.empty:
             st.info("No normalized bioactivity results found for this endpoint.")
         else:
             st.caption(
-                f"Previewing {len(results_df):,} of {total_results:,} bioactivity_results rows. "
+                f"Previewing {len(results_df):,} of {total_results:,} {data_source} rows. "
                 "The on-screen table stays capped for performance."
             )
             st.dataframe(results_df, use_container_width=True, hide_index=True)
@@ -1209,16 +1443,10 @@ def render_browse_tab(selected_endpoint: EndpointConfig) -> None:
             )
             if prepare_full_export:
                 with st.spinner("Preparing full results export..."):
-                    with get_conn() as conn:
-                        full_rows = fetch_bioactivity_results(
-                            conn,
-                            endpoint_id=selected_endpoint.endpoint_id,
-                            limit=None,
-                        )
-                    full_results_df = _format_results_dataframe(full_rows)
+                    _, full_results_df, full_data_source = _load_results_for_endpoint(selected_endpoint, None)
                 st.caption(f"Full export contains {len(full_results_df):,} rows.")
                 st.download_button(
-                    label="Download full results CSV",
+                    label=f"Download full {full_data_source} CSV",
                     data=full_results_df.to_csv(index=False).encode("utf-8"),
                     file_name=f"{selected_endpoint.endpoint_key}_bioactivity_results_all.csv",
                     mime="text/csv",
@@ -1241,18 +1469,18 @@ def render_dashboard_tab(selected_endpoint: EndpointConfig) -> None:
     )
 
     try:
-        with get_conn() as conn:
-            total_results = count_bioactivity_results(conn, selected_endpoint.endpoint_id)
-            rows = fetch_bioactivity_results(conn, endpoint_id=selected_endpoint.endpoint_id, limit=max_rows)
-        dashboard_df = _format_results_dataframe(rows)
+        total_results, dashboard_df, data_source = _load_results_for_endpoint(selected_endpoint, max_rows)
     except Exception as exc:
         st.error(f"Failed to load dashboard data: {exc}")
         total_results = 0
         dashboard_df = pd.DataFrame()
+        data_source = "bioactivity_results"
 
     if dashboard_df.empty:
         st.info("No normalized bioactivity data available for this endpoint yet.")
         return
+
+    st.caption(f"Dashboard source: {data_source}.")
 
     metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
     metric_col1.metric("Results", f"{total_results:,}")
@@ -1314,14 +1542,14 @@ def render_dashboard_tab(selected_endpoint: EndpointConfig) -> None:
             if standard_hist.empty:
                 st.info("No standardized numeric values.")
             else:
-                st.bar_chart(standard_hist.set_index("bin_start")[["count"]])
+                st.bar_chart(histogram_chart_data(standard_hist))
         with value_col2:
             st.caption("p-value histogram")
             p_value_hist = build_histogram_counts(concentration_df["p_value_numeric"], bins=30)
             if p_value_hist.empty:
                 st.info("No p-values.")
             else:
-                st.bar_chart(p_value_hist.set_index("bin_start")[["count"]])
+                st.bar_chart(histogram_chart_data(p_value_hist))
 
     st.markdown("### Trend and Top Compounds")
     trend_col1, trend_col2 = st.columns(2)

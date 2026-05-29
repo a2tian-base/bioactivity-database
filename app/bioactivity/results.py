@@ -60,6 +60,34 @@ def _json_summary(value: object) -> str:
     return _clean_text(value)
 
 
+def _numeric_measurement_display(
+    *,
+    measurement_type: str,
+    value_kind: str,
+    standard_value: str,
+    standard_unit: str,
+    standard_relation: str,
+    original_value: str,
+    original_unit: str,
+    original_relation: str,
+) -> str:
+    display_value = standard_value or original_value
+    if not display_value:
+        return measurement_type or value_kind
+
+    display_unit = standard_unit or original_unit
+    display_relation = standard_relation if standard_value else original_relation
+    return " ".join(
+        part
+        for part in [
+            measurement_type,
+            f"{display_relation}{display_value}".strip(),
+            display_unit,
+        ]
+        if part
+    )
+
+
 def manual_entry_schema(endpoint: EndpointConfig) -> ManualEntrySchema:
     measurement = _as_dict(endpoint.spec.get("measurement"))
     normalization = _as_dict(endpoint.spec.get("normalization"))
@@ -192,18 +220,16 @@ def format_bioactivity_result_row(row: Mapping[str, Any]) -> dict[str, Any]:
     p_value_relation = _relation_prefix(row.get("p_value_relation"))
     value_text = _clean_text(row.get("value_text"))
 
-    if value_kind == "concentration":
-        display_value = standard_value or original_value
-        display_unit = standard_unit or original_unit
-        display_relation = standard_relation if standard_value else original_relation
-        value_display = " ".join(
-            part
-            for part in [
-                measurement_type,
-                f"{display_relation}{display_value}".strip(),
-                display_unit,
-            ]
-            if part
+    if value_kind in {"concentration", "percent", "numeric"}:
+        value_display = _numeric_measurement_display(
+            measurement_type=measurement_type,
+            value_kind=value_kind,
+            standard_value=standard_value,
+            standard_unit=standard_unit,
+            standard_relation=standard_relation,
+            original_value=original_value,
+            original_unit=original_unit,
+            original_relation=original_relation,
         )
     elif value_text:
         value_display = f"{measurement_type}: {value_text}" if measurement_type else value_text
